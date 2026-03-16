@@ -1,6 +1,6 @@
-name: astrbot_plugin_hitsz
-display_name: HITSZ 课程助手
+name: astrbot_plugin_hit
+display_name: HIT智能助手
 author: HIT-A
-desc: 哈尔滨工业大学（深圳）课程查询、RAG 问答、PR 提交助手
+desc: 哈工大智能课程查询、资料搜索、群聊总结和贡献引导助手
 version: v1.0.0
-repo: https://github.com/HIT-A/astrbot_plugin_hitsz
+repo: https://github.com/HIT-A/astrbot_plugin_hit
