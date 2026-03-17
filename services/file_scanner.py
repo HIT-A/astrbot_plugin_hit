@@ -42,18 +42,36 @@ class ScanResult:
     error_message: Optional[str] = None
 
 
+@dataclass
+class IngestResult:
+    """入库结果"""
+
+    total_candidates: int
+    ingested_files: int
+    failed_files: int
+    skipped_files: int
+    ingest_time: datetime
+    details: List[Dict[str, Any]]
+    error_message: Optional[str] = None
+
+
 class FileScannerService:
     """群文件扫描服务"""
 
     def __init__(
         self,
-        cos_bucket: str,
-        cos_region: str,
-        cos_secret_id: str,
-        cos_secret_key: str,
+        cos_bucket: str = "",
+        cos_region: str = "",
+        cos_secret_id: str = "",
+        cos_secret_key: str = "",
+        plugin=None,
+        agent_client=None,
         max_file_size_mb: int = 50,
         supported_extensions: Optional[List[str]] = None,
+        **kwargs,
     ):
+        self.plugin = plugin
+        self.agent_client = agent_client
         self.cos_bucket = cos_bucket
         self.cos_region = cos_region
         self.cos_secret_id = cos_secret_id
@@ -72,6 +90,7 @@ class FileScannerService:
             "7z",
         ]
         self._scanned_hashes: set = set()  # 已扫描文件的哈希集合
+        self._uploaded_files: Dict[str, FileInfo] = {}  # 最近上传成功文件
         self._lock = asyncio.Lock()
 
     def _calculate_hash(self, content: bytes) -> str:
@@ -90,8 +109,8 @@ class FileScannerService:
     async def scan_group_files(
         self,
         group_id: str,
-        get_file_list_func: Callable[[str], List[Dict[str, Any]]],
-        download_file_func: Callable[[str], bytes],
+        get_file_list_func: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
+        download_file_func: Optional[Callable[[str], bytes]] = None,
     ) -> ScanResult:
         """
         扫描群文件
@@ -106,6 +125,19 @@ class FileScannerService:
         """
         logger.info(f"🔍 开始扫描群 {group_id} 的文件...")
         scan_time = datetime.now()
+
+        if get_file_list_func is None or download_file_func is None:
+            msg = "当前平台未接入群文件列表/下载回调，无法执行扫描。"
+            logger.warning(f"⚠️ {msg}")
+            return ScanResult(
+                total_files=0,
+                new_files=0,
+                uploaded_files=0,
+                failed_files=0,
+                files=[],
+                scan_time=scan_time,
+                error_message=msg,
+            )
 
         try:
             # 获取文件列表
@@ -173,6 +205,7 @@ class FileScannerService:
 
                         async with self._lock:
                             self._scanned_hashes.add(file_hash)
+                            self._uploaded_files[file_hash] = file_info
 
                         logger.info(f"✅ 文件上传成功: {file_info.file_name}")
                     else:
@@ -287,10 +320,132 @@ class FileScannerService:
         async with self._lock:
             return file_hash in self._scanned_hashes
 
+    async def add_uploaded_candidate(
+        self,
+        file_name: str,
+        cos_url: str,
+        file_hash: str = "",
+        uploader_id: str = "",
+        uploader_name: str = "",
+    ) -> None:
+        """向待入库集合注入候选文件（用于手动补录/测试）。"""
+        now = datetime.now()
+        if not file_hash:
+            file_hash = hashlib.md5(f"{file_name}:{cos_url}:{now.isoformat()}".encode()).hexdigest()
+
+        info = FileInfo(
+            file_id=file_hash,
+            file_name=file_name,
+            file_size=0,
+            file_url=cos_url,
+            uploader_id=uploader_id,
+            uploader_name=uploader_name,
+            upload_time=now,
+            file_hash=file_hash,
+            cos_url=cos_url,
+            status="uploaded",
+        )
+        async with self._lock:
+            self._uploaded_files[file_hash] = info
+
+    async def ingest_uploaded_files(self, limit: int = 20) -> IngestResult:
+        """将已上传文件批量提交给 rag.ingest。"""
+        now = datetime.now()
+
+        if not self.agent_client:
+            return IngestResult(
+                total_candidates=0,
+                ingested_files=0,
+                failed_files=0,
+                skipped_files=0,
+                ingest_time=now,
+                details=[],
+                error_message="Agent 客户端未初始化，无法执行入库。",
+            )
+
+        safe_limit = max(1, min(limit, 100))
+        async with self._lock:
+            candidates = list(self._uploaded_files.values())[:safe_limit]
+
+        if not candidates:
+            return IngestResult(
+                total_candidates=0,
+                ingested_files=0,
+                failed_files=0,
+                skipped_files=0,
+                ingest_time=now,
+                details=[],
+                error_message="没有可入库的候选文件，请先执行 /hit scan 或补录候选。",
+            )
+
+        ingested = 0
+        failed = 0
+        details: List[Dict[str, Any]] = []
+
+        for file_info in candidates:
+            if not file_info.cos_url:
+                details.append(
+                    {
+                        "file_name": file_info.file_name,
+                        "status": "skipped",
+                        "error": "缺少 cos_url",
+                    }
+                )
+                continue
+
+            payload = {
+                "source": "group_file",
+                "url": file_info.cos_url,
+                "title": file_info.file_name,
+                "metadata": {
+                    "file_hash": file_info.file_hash,
+                    "uploader_id": file_info.uploader_id,
+                    "uploader_name": file_info.uploader_name,
+                    "upload_time": file_info.upload_time.isoformat(),
+                },
+            }
+
+            try:
+                result = await self.agent_client.invoke_skill("rag.ingest", payload)
+                if result.success:
+                    ingested += 1
+                    details.append({"file_name": file_info.file_name, "status": "ingested"})
+                else:
+                    failed += 1
+                    err = (result.error or {}).get("message", "未知错误")
+                    details.append(
+                        {
+                            "file_name": file_info.file_name,
+                            "status": "failed",
+                            "error": err,
+                        }
+                    )
+            except Exception as e:
+                failed += 1
+                details.append(
+                    {
+                        "file_name": file_info.file_name,
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                )
+
+        skipped = len([d for d in details if d.get("status") == "skipped"])
+        return IngestResult(
+            total_candidates=len(candidates),
+            ingested_files=ingested,
+            failed_files=failed,
+            skipped_files=skipped,
+            ingest_time=now,
+            details=details,
+            error_message=None,
+        )
+
     def get_statistics(self) -> Dict[str, Any]:
         """获取统计信息"""
         return {
             "total_scanned": len(self._scanned_hashes),
+            "uploaded_pending_ingest": len(self._uploaded_files),
             "max_file_size_mb": self.max_file_size / (1024 * 1024),
             "supported_extensions": self.supported_extensions,
             "cos_bucket": self.cos_bucket,

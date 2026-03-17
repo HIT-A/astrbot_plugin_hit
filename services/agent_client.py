@@ -162,6 +162,7 @@ class AgentClient:
     async def get_course_detail(
         self,
         course_code: str,
+        campus: str = "shenzhen",
     ) -> AgentResponse:
         """
         获取课程详情
@@ -173,8 +174,8 @@ class AgentClient:
             AgentResponse
         """
         return await self.invoke_skill(
-            "courses.get",
-            {"course_code": course_code},
+            "course.read",
+            {"campus": campus, "course_code": course_code},
         )
 
     async def search_files(
@@ -197,15 +198,17 @@ class AgentClient:
             AgentResponse
         """
         input_data = {
-            "keyword": keyword,
-            "limit": limit,
+            "query": keyword,
+            "sources": ["cos", "rag"],
+            "top_k": limit,
+            "summarize": False,
         }
         if course_code:
             input_data["course_code"] = course_code
         if file_type:
             input_data["file_type"] = file_type
 
-        return await self.invoke_skill("files.search", input_data)
+        return await self.invoke_skill("search", input_data)
 
     async def upload_file(
         self,

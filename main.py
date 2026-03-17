@@ -233,7 +233,7 @@ class HITPlugin(Star):
         while True:
             try:
                 loop_count += 1
-                self.intent_service._check_and_reset_quota()
+                await self.intent_service._check_and_reset_quota()
                 now = datetime.now()
                 quota_status = self.intent_service.get_quota_status()
 
@@ -408,7 +408,35 @@ class HITPlugin(Star):
 
         debug_log(f"处理文件搜索: query={query}, keywords={keywords}")
         await event.send(event.plain_result(f"🔍 正在为您搜索「{query}」相关资料..."))
-        # TODO: 调用文件搜索服务
+        try:
+            result = await self.agent_client.search_files(query, limit=10)
+            if not result.success:
+                err = (result.error or {}).get("message", "未知错误")
+                await event.send(event.plain_result(f"❌ 文件搜索失败: {err}"))
+                return
+
+            output = result.output or {}
+            files = output.get("results") or output.get("files") or []
+            if not files:
+                await event.send(event.plain_result(f"🔍 未找到「{query}」相关资料"))
+                return
+
+            msg = f"🔍 找到 {len(files)} 个相关文件:\n\n"
+            for i, file in enumerate(files[:8], 1):
+                name = file.get("name") or file.get("file_name") or "未命名"
+                source = file.get("source") or "未知来源"
+                url = file.get("url") or file.get("download_url") or ""
+                msg += f"{i}. 📄 {name} ({source})\n"
+                if url:
+                    msg += f"   {url}\n"
+
+            if len(files) > 8:
+                msg += f"\n... 还有 {len(files) - 8} 个结果"
+
+            await event.send(event.plain_result(msg))
+        except Exception as e:
+            debug_log(f"❌ 文件搜索失败: {e}", "ERROR")
+            await event.send(event.plain_result(f"❌ 文件搜索失败: {e}"))
 
     async def _handle_deep_search(self, event: AstrMessageEvent, intent_result):
         """处理深度搜索"""
@@ -425,7 +453,43 @@ class HITPlugin(Star):
             return
 
         await event.send(event.plain_result(f"🔍 正在深度搜索「{query}」..."))
-        # TODO: 调用深度搜索服务
+        try:
+            result = await self.agent_client.invoke_skill(
+                "search",
+                {
+                    "query": query,
+                    "sources": ["rag", "brave", "annas", "arxiv", "github"],
+                    "top_k": 5,
+                    "summarize": True,
+                },
+            )
+            if not result.success:
+                err = (result.error or {}).get("message", "未知错误")
+                await event.send(event.plain_result(f"❌ 深度搜索失败: {err}"))
+                return
+
+            output = result.output or {}
+            rows = output.get("results") or []
+            if not rows:
+                await event.send(event.plain_result(f"🔍 未找到「{query}」相关深度资料"))
+                return
+
+            msg = f"🔍 深度搜索结果（{len(rows)}条）:\n\n"
+            for i, row in enumerate(rows[:5], 1):
+                title = row.get("title") or "未命名"
+                source = row.get("source") or ""
+                url = row.get("url") or ""
+                msg += f"{i}. {title}"
+                if source:
+                    msg += f" [{source}]"
+                msg += "\n"
+                if url:
+                    msg += f"   {url}\n"
+
+            await event.send(event.plain_result(msg))
+        except Exception as e:
+            debug_log(f"❌ 深度搜索失败: {e}", "ERROR")
+            await event.send(event.plain_result(f"❌ 深度搜索失败: {e}"))
 
     async def _handle_contribution(self, event: AstrMessageEvent, intent_result):
         """处理贡献引导"""
@@ -438,14 +502,14 @@ class HITPlugin(Star):
 
         try:
             debug_log(f"调用 agent_client.search_course: {query}")
-            result = await self.agent_client.call_skill(
+            result = await self.agent_client.invoke_skill(
                 "courses.search", {"keyword": query, "limit": 10}
             )
 
-            debug_log(f"搜索结果: ok={result.get('ok')}", "DEBUG")
+            debug_log(f"搜索结果: ok={result.success}", "DEBUG")
 
-            if not result.get("ok"):
-                error = result.get("error", {})
+            if not result.success:
+                error = result.error or {}
                 debug_log(f"搜索失败: {error}", "ERROR")
                 await event.send(
                     event.plain_result(
@@ -454,7 +518,7 @@ class HITPlugin(Star):
                 )
                 return
 
-            output = result.get("output", {})
+            output = result.output or {}
             courses = output.get("results", [])
             debug_log(f"找到 {len(courses)} 个课程")
 
@@ -518,8 +582,10 @@ class HITPlugin(Star):
 
                 # 执行每日总结
                 debug_log("📝 开始生成每日总结...")
-                await self.chat_summarizer.generate_summary()
-                debug_log("✅ 每日总结生成完成")
+                summary = await self.chat_summarizer.generate_summary(
+                    group_id="all", messages=[]
+                )
+                debug_log(f"✅ 每日总结生成完成: group={summary.group_id}")
 
             except Exception as e:
                 debug_log(f"❌ 每日总结循环错误: {e}", "ERROR")
@@ -600,7 +666,18 @@ class HITPlugin(Star):
         try:
             result = await self.file_scanner.scan_group_files(group_id)
             debug_log(f"扫描完成: {result}")
-            await event.send(event.plain_result(result))
+            if result.error_message:
+                await event.send(event.plain_result(f"❌ 扫描失败: {result.error_message}"))
+                return
+
+            msg = (
+                "📁 群文件扫描完成\n"
+                f"总文件: {result.total_files}\n"
+                f"新增: {result.new_files}\n"
+                f"上传成功: {result.uploaded_files}\n"
+                f"失败: {result.failed_files}"
+            )
+            await event.send(event.plain_result(msg))
         except Exception as e:
             debug_log(f"❌ 扫描群文件失败: {e}", "ERROR")
             import traceback
@@ -613,8 +690,9 @@ class HITPlugin(Star):
         """查看插件状态"""
         debug_log(f"用户 {event.get_sender_name()} 请求状态信息")
 
-        self.intent_service._check_and_reset_quota()
+        await self.intent_service._check_and_reset_quota()
         quota_status = self.intent_service.get_quota_status()
+        scanner_stats = self.file_scanner.get_statistics()
 
         msg = f"""📊 HIT智能助手状态
 
@@ -624,6 +702,10 @@ class HITPlugin(Star):
 
 💬 消息队列:
   活跃队列数: {len(self.queue_manager.get_all_queues())}
+
+📁 文件扫描:
+    已扫描哈希: {scanner_stats["total_scanned"]}
+    待入库文件: {scanner_stats.get("uploaded_pending_ingest", 0)}
 
 ⏰ 定时任务:
   意图判断: {"✅ 运行中" if self._tasks and any(not t.done() for t in self._tasks[:1]) else "❌ 已停止"}
@@ -639,6 +721,71 @@ class HITPlugin(Star):
 """
         debug_log(f"状态信息:\n{msg}", "DEBUG")
         await event.send(event.plain_result(msg))
+
+    @hit_group.command("file")
+    async def file_cmd(self, event: AstrMessageEvent, query: str = ""):
+        """按关键词搜索文件资料"""
+        if not query.strip():
+            await event.send(event.plain_result("❌ 请输入关键词\n用法: /hit file 自动控制 课件"))
+            return
+
+        class _SimpleIntentResult:
+            extracted_info = {"keywords": query.split()}
+
+        await self._handle_file_search(event, _SimpleIntentResult())
+
+    @hit_group.command("search")
+    async def search_cmd(self, event: AstrMessageEvent, query: str = ""):
+        """按关键词执行深度搜索"""
+        if not query.strip():
+            await event.send(event.plain_result("❌ 请输入关键词\n用法: /hit search 保研政策"))
+            return
+
+        class _SimpleIntentResult:
+            extracted_info = {"keywords": query.split()}
+
+        await self._handle_deep_search(event, _SimpleIntentResult())
+
+    @hit_group.command("ingest")
+    async def ingest_cmd(self, event: AstrMessageEvent, limit: str = "20"):
+        """触发批量入库（rag.ingest）"""
+        try:
+            parsed_limit = int(limit)
+        except Exception:
+            await event.send(event.plain_result("❌ limit 必须是整数，例如: /hit ingest 20"))
+            return
+
+        if parsed_limit <= 0:
+            await event.send(event.plain_result("❌ limit 必须大于 0"))
+            return
+
+        safe_limit = min(parsed_limit, 100)
+        await event.send(event.plain_result(f"📥 开始入库，最多处理 {safe_limit} 个文件..."))
+
+        try:
+            result = await self.file_scanner.ingest_uploaded_files(limit=safe_limit)
+            if result.error_message and result.total_candidates == 0:
+                await event.send(event.plain_result(f"⚠️ 入库未执行: {result.error_message}"))
+                return
+
+            msg = (
+                "📥 入库完成\n"
+                f"候选文件: {result.total_candidates}\n"
+                f"入库成功: {result.ingested_files}\n"
+                f"入库失败: {result.failed_files}\n"
+                f"跳过: {result.skipped_files}"
+            )
+
+            failed_items = [d for d in result.details if d.get("status") == "failed"]
+            if failed_items:
+                msg += "\n\n失败详情:\n"
+                for item in failed_items[:5]:
+                    msg += f"- {item.get('file_name', 'unknown')}: {item.get('error', '未知错误')}\n"
+
+            await event.send(event.plain_result(msg))
+        except Exception as e:
+            debug_log(f"❌ 入库失败: {e}", "ERROR")
+            await event.send(event.plain_result(f"❌ 入库失败: {e}"))
 
     @hit_group.command("debug")
     async def debug_cmd(self, event: AstrMessageEvent):
