@@ -16,7 +16,7 @@ class PluginConfig:
     gemini_model: str = "gemini-2.5-flash-preview-05-20"
 
     # Agent Backend配置
-    agent_backend_url: str = "http://localhost:8080"
+    agent_backend_url: str = "http://139.199.173.108:8080"
     agent_backend_api_key: str = ""
 
     # 定时任务配置
@@ -34,6 +34,9 @@ class PluginConfig:
     # 上下文管理
     context_window_minutes: int = 3
     max_context_length: int = 4000
+
+    # 报错诊断日志
+    error_log_enabled: bool = True
 
     def __post_init__(self):
         if self.supported_extensions is None:
@@ -58,19 +61,26 @@ class ConfigManager:
 
     def _load_config(self) -> PluginConfig:
         """从环境变量加载配置"""
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
         return PluginConfig(
             gemini_api_key=os.getenv("HITSZ_GEMINI_API_KEY", ""),
             gemini_model=os.getenv(
                 "HITSZ_GEMINI_MODEL", "gemini-2.5-flash-preview-05-20"
             ),
             agent_backend_url=os.getenv(
-                "HITSZ_AGENT_BACKEND_URL", "http://localhost:8080"
+                "HITSZ_AGENT_BACKEND_URL", "http://139.199.173.108:8080"
             ),
             agent_backend_api_key=os.getenv("HITSZ_AGENT_BACKEND_API_KEY", ""),
             intent_check_interval=int(os.getenv("HITSZ_INTENT_CHECK_INTERVAL", "180")),
             daily_summary_time=os.getenv("HITSZ_DAILY_SUMMARY_TIME", "22:30"),
             max_file_size_mb=int(os.getenv("HITSZ_MAX_FILE_SIZE_MB", "50")),
             context_window_minutes=int(os.getenv("HITSZ_CONTEXT_WINDOW_MINUTES", "3")),
+            error_log_enabled=_env_bool("HITSZ_ERROR_LOG_ENABLED", True),
         )
 
     def get_group_config(self, group_id: str) -> Dict[str, Any]:

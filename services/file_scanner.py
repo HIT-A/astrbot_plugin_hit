@@ -5,6 +5,9 @@
 import os
 import hashlib
 import asyncio
+import base64
+import inspect
+import mimetypes
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
@@ -141,9 +144,9 @@ class FileScannerService:
 
         try:
             # 获取文件列表
-            file_list = await asyncio.get_event_loop().run_in_executor(
-                None, get_file_list_func, group_id
-            )
+            file_list = await self._invoke_callback(get_file_list_func, group_id)
+            if not isinstance(file_list, list):
+                file_list = []
 
             files: List[FileInfo] = []
             new_files = 0
@@ -176,9 +179,17 @@ class FileScannerService:
 
                 try:
                     # 下载文件并计算哈希
-                    file_content = await asyncio.get_event_loop().run_in_executor(
-                        None, download_file_func, file_info.file_id
+                    file_content = await self._invoke_callback(
+                        download_file_func,
+                        {
+                            "file_id": file_info.file_id,
+                            "file_name": file_info.file_name,
+                            "file_size": file_info.file_size,
+                            "file_url": file_info.file_url,
+                        },
                     )
+                    if not isinstance(file_content, (bytes, bytearray)):
+                        raise TypeError("download callback must return bytes")
 
                     file_hash = self._calculate_hash(file_content)
                     file_info.file_hash = file_hash
@@ -248,6 +259,19 @@ class FileScannerService:
                 error_message=str(e),
             )
 
+    async def _invoke_callback(self, callback: Callable[..., Any], *args) -> Any:
+        """兼容同步/异步回调调用。"""
+        if callback is None:
+            return None
+
+        if inspect.iscoroutinefunction(callback):
+            return await callback(*args)
+
+        result = callback(*args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def _upload_to_cos(
         self, file_content: bytes, file_name: str, file_hash: str
     ) -> Optional[str]:
@@ -263,34 +287,58 @@ class FileScannerService:
             COS文件URL或None（上传失败）
         """
         try:
-            # 构建COS对象键
-            ext = file_name.lower().split(".")[-1] if "." in file_name else ""
-            object_key = (
-                f"group-files/{file_hash[:2]}/{file_hash[2:4]}/{file_hash}.{ext}"
+            if not self.agent_client:
+                logger.error("❌ Agent 客户端未初始化，无法上传到 COS")
+                return None
+
+            ext = ""
+            if "." in file_name:
+                ext = file_name.rsplit(".", 1)[-1].lower()
+            key_suffix = f".{ext}" if ext else ""
+            object_key = f"group-files/{file_hash[:2]}/{file_hash[2:4]}/{file_hash}{key_suffix}"
+            content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+            result = await self.agent_client.invoke_skill(
+                "files.upload",
+                {
+                    "key": object_key,
+                    "content_base64": base64.b64encode(file_content).decode("utf-8"),
+                    "content_type": content_type,
+                },
+                timeout=120.0,
             )
 
-            # 这里使用腾讯云COS SDK或HTTP API上传
-            # 实际实现需要根据具体的COS SDK进行
-            cos_url = f"https://{self.cos_bucket}.cos.{self.cos_region}.myqcloud.com/{object_key}"
+            if not result.success:
+                msg = (result.error or {}).get("message", "未知错误")
+                logger.error(f"❌ files.upload 失败: {msg}")
+                return None
 
-            # TODO: 实现实际的COS上传逻辑
-            # 示例使用PUT请求上传
-            # async with httpx.AsyncClient() as client:
-            #     # 获取临时密钥或签名
-            #     auth = self._get_cos_auth("PUT", object_key)
-            #     resp = await client.put(
-            #         cos_url,
-            #         content=file_content,
-            #         headers={
-            #             "Authorization": auth,
-            #             "Content-Type": "application/octet-stream",
-            #         },
-            #     )
-            #     resp.raise_for_status()
+            out = result.output or {}
+            # 兼容不同后端返回：access_url/url/key/results
+            url = str(out.get("access_url") or out.get("url") or "").strip()
+            if url:
+                logger.info(f"☁️ 文件上传到 COS 成功: {url}")
+                return url
 
-            logger.info(f"☁️ 文件上传到COS: {object_key}")
-            return cos_url
+            key = str(out.get("key") or "").strip()
+            if key:
+                logger.info(f"☁️ 文件上传到 COS 成功: key={key}")
+                return f"key://{key}"
 
+            results = out.get("results")
+            if isinstance(results, list) and results:
+                first = results[0] if isinstance(results[0], dict) else {}
+                url = str(first.get("access_url") or first.get("url") or "").strip()
+                if url:
+                    logger.info(f"☁️ 文件上传到 COS 成功: {url}")
+                    return url
+                key = str(first.get("key") or "").strip()
+                if key:
+                    logger.info(f"☁️ 文件上传到 COS 成功: key={key}")
+                    return f"key://{key}"
+
+            logger.warning("⚠️ files.upload 成功但未返回 url/key，回退记录 object key")
+            return f"key://{object_key}"
         except Exception as e:
             logger.error(f"❌ 上传到COS失败: {e}")
             return None
@@ -349,7 +397,7 @@ class FileScannerService:
             self._uploaded_files[file_hash] = info
 
     async def ingest_uploaded_files(self, limit: int = 20) -> IngestResult:
-        """将已上传文件批量提交给 rag.ingest。"""
+        """将已上传文件批量提交给 data.ingest。"""
         now = datetime.now()
 
         if not self.agent_client:
@@ -394,22 +442,32 @@ class FileScannerService:
                 continue
 
             payload = {
-                "source": "group_file",
-                "url": file_info.cos_url,
-                "title": file_info.file_name,
-                "metadata": {
-                    "file_hash": file_info.file_hash,
-                    "uploader_id": file_info.uploader_id,
-                    "uploader_name": file_info.uploader_name,
-                    "upload_time": file_info.upload_time.isoformat(),
-                },
+                "source_type": "manual",
+                "source_name": file_info.file_name,
+                "content": (
+                    f"上传文件: {file_info.file_name}\n"
+                    f"COS链接: {file_info.cos_url}\n"
+                    f"上传者: {file_info.uploader_name or file_info.uploader_id}\n"
+                    f"上传时间: {file_info.upload_time.isoformat()}\n"
+                    f"文件哈希: {file_info.file_hash or ''}\n"
+                ),
+                "store_in_cos": False,
+                "auto_ingest_rag": True,
+                "overwrite": False,
             }
 
             try:
-                result = await self.agent_client.invoke_skill("rag.ingest", payload)
+                result = await self.agent_client.invoke_skill("data.ingest", payload)
                 if result.success:
                     ingested += 1
-                    details.append({"file_name": file_info.file_name, "status": "ingested"})
+                    output = result.output or {}
+                    details.append(
+                        {
+                            "file_name": file_info.file_name,
+                            "status": output.get("status") or "ingested",
+                            "job_id": output.get("job_id", ""),
+                        }
+                    )
                 else:
                     failed += 1
                     err = (result.error or {}).get("message", "未知错误")

@@ -15,6 +15,8 @@ HIT智能助手 - AstrBot插件 v2.0.1
 
 import os
 import asyncio
+import traceback
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -65,9 +67,11 @@ class HITPlugin(Star):
         # 配置管理
         debug_log("正在加载配置管理器...")
         self.config_manager = ConfigManager()
+        self.error_log_enabled = self.config_manager.config.error_log_enabled
         debug_log(
             f"配置加载完成: Gemini额度={self.config_manager.config.gemini_daily_quota}"
         )
+        debug_log(f"报错诊断日志: {'开启' if self.error_log_enabled else '关闭'}")
 
         # 消息队列管理
         debug_log("正在初始化消息队列管理器...")
@@ -82,6 +86,16 @@ class HITPlugin(Star):
         self._tasks: list = []
         debug_log("HITPlugin 初始化完成")
         debug_log("=" * 60)
+
+    def _set_error_log_enabled(self, enabled: bool):
+        self.error_log_enabled = enabled
+        self.config_manager.config.error_log_enabled = enabled
+        os.environ["HITSZ_ERROR_LOG_ENABLED"] = "true" if enabled else "false"
+
+    def _log_exception(self, where: str, err: Exception):
+        debug_log(f"❌ {where}: {err}", "ERROR")
+        if self.error_log_enabled:
+            debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
 
     def _init_services(self):
         """初始化服务"""
@@ -284,10 +298,7 @@ class HITPlugin(Star):
                 await asyncio.sleep(wait_time)
 
             except Exception as e:
-                debug_log(f"❌ 意图判断循环错误: {e}", "ERROR")
-                import traceback
-
-                debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+                self._log_exception("意图判断循环错误", e)
                 await asyncio.sleep(60)
 
     async def _analyze_and_respond(self, queue_key: str, queue):
@@ -346,10 +357,7 @@ class HITPlugin(Star):
             debug_log(f"队列 {queue_key} 已标记为已处理", "DEBUG")
 
         except Exception as e:
-            debug_log(f"❌ 分析意图失败: {e}", "ERROR")
-            import traceback
-
-            debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+            self._log_exception("分析意图失败", e)
 
     async def _execute_intent(self, event: AstrMessageEvent, intent_result):
         """根据意图执行操作"""
@@ -371,10 +379,7 @@ class HITPlugin(Star):
                 await handler(event, intent_result)
                 debug_log(f"意图处理器执行完成: {handler.__name__}")
             except Exception as e:
-                debug_log(f"❌ 意图处理器执行失败: {e}", "ERROR")
-                import traceback
-
-                debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+                self._log_exception("意图处理器执行失败", e)
         else:
             debug_log(f"未找到意图处理器: {intent_result.intent}", "WARNING")
 
@@ -477,7 +482,7 @@ class HITPlugin(Star):
 
             await event.send(event.plain_result(msg))
         except Exception as e:
-            debug_log(f"❌ 文件搜索失败: {e}", "ERROR")
+            self._log_exception("文件搜索失败", e)
             await event.send(event.plain_result(f"❌ 文件搜索失败: {e}"))
 
     async def _handle_deep_search(self, event: AstrMessageEvent, intent_result):
@@ -557,7 +562,7 @@ class HITPlugin(Star):
 
             await event.send(event.plain_result(msg))
         except Exception as e:
-            debug_log(f"❌ 深度搜索失败: {e}", "ERROR")
+            self._log_exception("深度搜索失败", e)
             await event.send(event.plain_result(f"❌ 深度搜索失败: {e}"))
 
     async def _handle_contribution(self, event: AstrMessageEvent, intent_result):
@@ -615,11 +620,109 @@ class HITPlugin(Star):
             await event.send(event.plain_result(msg))
 
         except Exception as e:
-            debug_log(f"❌ 搜索课程失败: {e}", "ERROR")
-            import traceback
-
-            debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+            self._log_exception("搜索课程失败", e)
             await event.send(event.plain_result(f"❌ 搜索失败: {str(e)}"))
+
+    async def _napcat_call_action(self, event: AstrMessageEvent, action: str, **kwargs):
+        """调用 Napcat/OneBot API。"""
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            raise RuntimeError("当前 event 无 bot，无法调用 Napcat API")
+        api = getattr(bot, "api", None)
+        if api is None:
+            raise RuntimeError("当前平台 bot 无 api 对象")
+        call_action = getattr(api, "call_action", None)
+        if call_action is None:
+            raise RuntimeError("当前平台 api 不支持 call_action")
+        return await call_action(action, **kwargs)
+
+    async def _napcat_get_group_file_list(self, event: AstrMessageEvent, group_id: str):
+        """获取群文件列表（当前先取根目录）。"""
+        payloads = [
+            {"group_id": str(group_id), "file_count": 200},
+            {"group_id": str(group_id), "folder_id": "/", "file_count": 200},
+            {"group_id": str(group_id), "folder": "/", "file_count": 200},
+        ]
+
+        last_err = None
+        data = None
+        for body in payloads:
+            try:
+                resp = await self._napcat_call_action(event, "get_group_files_by_folder", **body)
+                if isinstance(resp, dict):
+                    data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                else:
+                    data = None
+                if isinstance(data, dict):
+                    break
+            except Exception as e:
+                last_err = e
+
+        if not isinstance(data, dict):
+            if last_err:
+                raise last_err
+            return []
+
+        files_raw = data.get("files") if isinstance(data.get("files"), list) else []
+        out = []
+        for row in files_raw:
+            if not isinstance(row, dict):
+                continue
+            item = {
+                "file_id": str(row.get("file_id") or row.get("fileId") or row.get("id") or "").strip(),
+                "file_name": str(row.get("file_name") or row.get("fileName") or row.get("name") or "").strip(),
+                "file_size": int(row.get("file_size") or row.get("size") or 0),
+                "file_url": str(row.get("file_url") or row.get("url") or "").strip(),
+                "uploader_id": str(row.get("uploader_id") or row.get("uploader") or row.get("uploader_uin") or "").strip(),
+                "uploader_name": str(row.get("uploader_name") or row.get("uploader_nick") or "").strip(),
+                "busid": str(row.get("busid") or row.get("bus_id") or "").strip(),
+            }
+            if item["file_id"] and item["file_name"]:
+                out.append(item)
+        return out
+
+    async def _napcat_download_group_file(self, event: AstrMessageEvent, file_ref: Dict[str, str]):
+        """下载群文件并返回 bytes。"""
+        file_id = str(file_ref.get("file_id") or "").strip()
+        file_name = str(file_ref.get("file_name") or "").strip() or f"{file_id}.bin"
+        file_url = str(file_ref.get("file_url") or "").strip()
+        group_id = str(event.get_group_id() or "").strip()
+        busid = str(file_ref.get("busid") or "").strip()
+
+        url_to_download = file_url
+        if not url_to_download and file_id:
+            try:
+                args = {"group_id": group_id, "file_id": file_id}
+                if busid:
+                    args["busid"] = busid
+                resp = await self._napcat_call_action(event, "get_group_file_url", **args)
+                if isinstance(resp, dict):
+                    data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+                    if isinstance(data, dict):
+                        url_to_download = str(data.get("url") or data.get("download_url") or "").strip()
+            except Exception:
+                url_to_download = ""
+
+        if not url_to_download:
+            raise RuntimeError(f"无法获取文件下载地址: {file_name} ({file_id})")
+
+        resp = await self._napcat_call_action(
+            event,
+            "download_file",
+            url=url_to_download,
+            name=file_name,
+        )
+        data = resp.get("data") if isinstance(resp, dict) and isinstance(resp.get("data"), dict) else resp
+        if not isinstance(data, dict):
+            raise RuntimeError("download_file 返回格式异常")
+        file_path = str(data.get("file") or "").strip()
+        if not file_path:
+            raise RuntimeError("download_file 未返回文件路径")
+
+        p = Path(file_path)
+        if not p.exists():
+            raise RuntimeError(f"download_file 返回路径不存在: {file_path}")
+        return p.read_bytes()
 
     # ==================== 每日总结循环 ====================
 
@@ -657,10 +760,7 @@ class HITPlugin(Star):
                 debug_log(f"✅ 每日总结生成完成: group={summary.group_id}")
 
             except Exception as e:
-                debug_log(f"❌ 每日总结循环错误: {e}", "ERROR")
-                import traceback
-
-                debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+                self._log_exception("每日总结循环错误", e)
                 await asyncio.sleep(3600)
 
     # ==================== 指令 ====================
@@ -700,7 +800,8 @@ class HITPlugin(Star):
   /hit status - 查看插件状态
 
 🔧 Debug:
-  当前模式: {"DEBUG" if DEBUG_MODE else "PRODUCTION"}
+    当前模式: {"DEBUG" if DEBUG_MODE else "PRODUCTION"}
+    报错诊断日志: {"开启" if self.error_log_enabled else "关闭"}
 """
         await event.send(event.plain_result(msg))
 
@@ -733,7 +834,23 @@ class HITPlugin(Star):
         await event.send(event.plain_result("📁 开始扫描群文件，请稍候..."))
 
         try:
-            result = await self.file_scanner.scan_group_files(group_id)
+            async def _list_cb(gid: str):
+                return await self._napcat_get_group_file_list(event, gid)
+
+            async def _download_cb(file_ref):
+                if isinstance(file_ref, dict):
+                    return await self._napcat_download_group_file(event, file_ref)
+                # 兼容旧签名（仅 file_id）
+                return await self._napcat_download_group_file(
+                    event,
+                    {"file_id": str(file_ref), "file_name": str(file_ref)},
+                )
+
+            result = await self.file_scanner.scan_group_files(
+                group_id,
+                get_file_list_func=_list_cb,
+                download_file_func=_download_cb,
+            )
             debug_log(f"扫描完成: {result}")
             if result.error_message:
                 await event.send(event.plain_result(f"❌ 扫描失败: {result.error_message}"))
@@ -748,10 +865,7 @@ class HITPlugin(Star):
             )
             await event.send(event.plain_result(msg))
         except Exception as e:
-            debug_log(f"❌ 扫描群文件失败: {e}", "ERROR")
-            import traceback
-
-            debug_log(f"错误堆栈: {traceback.format_exc()}", "ERROR")
+            self._log_exception("扫描群文件失败", e)
             await event.send(event.plain_result(f"❌ 扫描失败: {str(e)}"))
 
     @hit_group.command("status")
@@ -787,6 +901,7 @@ class HITPlugin(Star):
   聊天总结: {"✅" if self.chat_summarizer else "❌"}
 
 🔧 Debug模式: {"开启" if DEBUG_MODE else "关闭"}
+🐞 报错诊断日志: {"开启" if self.error_log_enabled else "关闭"}
 """
         debug_log(f"状态信息:\n{msg}", "DEBUG")
         await event.send(event.plain_result(msg))
@@ -858,8 +973,33 @@ class HITPlugin(Star):
 
             await event.send(event.plain_result(msg))
         except Exception as e:
-            debug_log(f"❌ 入库失败: {e}", "ERROR")
+            self._log_exception("入库失败", e)
             await event.send(event.plain_result(f"❌ 入库失败: {e}"))
+
+    @hit_group.command("errlog")
+    async def errlog_cmd(self, event: AstrMessageEvent, action: str = "status"):
+        """报错诊断日志开关（on/off/status）。"""
+        op = (action or "status").strip().lower()
+        if op in {"status", "s"}:
+            await event.send(
+                event.plain_result(
+                    "🐞 报错诊断日志当前状态: "
+                    + ("开启" if self.error_log_enabled else "关闭")
+                )
+            )
+            return
+
+        if op in {"on", "enable", "1", "true"}:
+            self._set_error_log_enabled(True)
+            await event.send(event.plain_result("✅ 已开启报错诊断日志"))
+            return
+
+        if op in {"off", "disable", "0", "false"}:
+            self._set_error_log_enabled(False)
+            await event.send(event.plain_result("✅ 已关闭报错诊断日志"))
+            return
+
+        await event.send(event.plain_result("❌ 用法: /hit errlog [on|off|status]"))
 
     @hit_group.command("debug")
     async def debug_cmd(self, event: AstrMessageEvent):
