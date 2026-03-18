@@ -409,24 +409,66 @@ class HITPlugin(Star):
         debug_log(f"处理文件搜索: query={query}, keywords={keywords}")
         await event.send(event.plain_result(f"🔍 正在为您搜索「{query}」相关资料..."))
         try:
-            result = await self.agent_client.search_files(query, limit=10)
-            if not result.success:
-                err = (result.error or {}).get("message", "未知错误")
-                await event.send(event.plain_result(f"❌ 文件搜索失败: {err}"))
-                return
+            tasks = await self.intent_service.plan_search_tasks(query, max_tasks=3)
+            if not tasks:
+                tasks = [
+                    {
+                        "query": query,
+                        "sources": ["cos", "rag", "course_read"],
+                        "reason": "fallback_empty_tasks",
+                    }
+                ]
 
-            output = result.output or {}
-            files = output.get("results") or output.get("files") or []
+            preferred_sources = {"cos", "rag", "course_read", "course"}
+            all_files = []
+
+            for idx, task in enumerate(tasks, 1):
+                sub_query = task.get("query") or query
+                raw_sources = task.get("sources") or []
+                sources = [s for s in raw_sources if s in preferred_sources]
+                if not sources:
+                    sources = ["cos", "rag", "course_read"]
+
+                result = await self.agent_client.invoke_skill(
+                    "search",
+                    {
+                        "query": sub_query,
+                        "sources": sources,
+                        "top_k": 6,
+                        "summarize": False,
+                    },
+                )
+                if not result.success:
+                    continue
+
+                rows = (result.output or {}).get("results") or []
+                for row in rows:
+                    row["_task_index"] = idx
+                    row["_task_query"] = sub_query
+                all_files.extend(rows)
+
+            deduped = []
+            seen = set()
+            for row in all_files:
+                key = row.get("url") or f"{row.get('title','')}::{row.get('source','')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(row)
+
+            files = deduped
             if not files:
                 await event.send(event.plain_result(f"🔍 未找到「{query}」相关资料"))
                 return
 
-            msg = f"🔍 找到 {len(files)} 个相关文件:\n\n"
+            msg = f"🔍 找到 {len(files)} 个相关资料（拆分任务 {len(tasks)} 个）:\n\n"
             for i, file in enumerate(files[:8], 1):
-                name = file.get("name") or file.get("file_name") or "未命名"
+                name = file.get("name") or file.get("title") or file.get("file_name") or "未命名"
                 source = file.get("source") or "未知来源"
                 url = file.get("url") or file.get("download_url") or ""
+                task_query = file.get("_task_query") or query
                 msg += f"{i}. 📄 {name} ({source})\n"
+                msg += f"   ↳ 子查询: {task_query}\n"
                 if url:
                     msg += f"   {url}\n"
 
@@ -454,35 +496,62 @@ class HITPlugin(Star):
 
         await event.send(event.plain_result(f"🔍 正在深度搜索「{query}」..."))
         try:
-            result = await self.agent_client.invoke_skill(
-                "search",
-                {
-                    "query": query,
-                    "sources": ["rag", "brave", "annas", "arxiv", "github"],
-                    "top_k": 5,
-                    "summarize": True,
-                },
-            )
-            if not result.success:
-                err = (result.error or {}).get("message", "未知错误")
-                await event.send(event.plain_result(f"❌ 深度搜索失败: {err}"))
-                return
+            tasks = await self.intent_service.plan_search_tasks(query, max_tasks=3)
+            if not tasks:
+                tasks = [
+                    {
+                        "query": query,
+                        "sources": ["rag", "brave", "annas", "arxiv", "github"],
+                        "reason": "fallback_empty_tasks",
+                    }
+                ]
 
-            output = result.output or {}
-            rows = output.get("results") or []
+            all_rows = []
+            for idx, task in enumerate(tasks, 1):
+                sub_query = task.get("query") or query
+                sources = task.get("sources") or ["rag", "brave"]
+                result = await self.agent_client.invoke_skill(
+                    "search",
+                    {
+                        "query": sub_query,
+                        "sources": sources,
+                        "top_k": 5,
+                        "summarize": False,
+                    },
+                )
+                if not result.success:
+                    continue
+                rows = (result.output or {}).get("results") or []
+                for row in rows:
+                    row["_task_index"] = idx
+                    row["_task_query"] = sub_query
+                all_rows.extend(rows)
+
+            # 去重（优先按URL，其次按标题+来源）
+            deduped = []
+            seen = set()
+            for row in all_rows:
+                key = row.get("url") or f"{row.get('title','')}::{row.get('source','')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(row)
+
+            rows = deduped
             if not rows:
                 await event.send(event.plain_result(f"🔍 未找到「{query}」相关深度资料"))
                 return
 
-            msg = f"🔍 深度搜索结果（{len(rows)}条）:\n\n"
+            msg = f"🔍 深度搜索结果（{len(rows)}条，拆分任务 {len(tasks)} 个）:\n\n"
             for i, row in enumerate(rows[:5], 1):
                 title = row.get("title") or "未命名"
                 source = row.get("source") or ""
                 url = row.get("url") or ""
+                task_query = row.get("_task_query") or query
                 msg += f"{i}. {title}"
                 if source:
                     msg += f" [{source}]"
-                msg += "\n"
+                msg += f"\n   ↳ 子查询: {task_query}\n"
                 if url:
                     msg += f"   {url}\n"
 
@@ -746,9 +815,14 @@ class HITPlugin(Star):
 
         await self._handle_deep_search(event, _SimpleIntentResult())
 
+    @hit_group.command("contribute")
+    async def contribute_cmd(self, event: AstrMessageEvent, content: str = ""):
+        """贡献课程内容（支持 preview/submit）。"""
+        await self.contribution_service.handle_contribute_command(event, content)
+
     @hit_group.command("ingest")
     async def ingest_cmd(self, event: AstrMessageEvent, limit: str = "20"):
-        """触发批量入库（rag.ingest）"""
+        """触发批量入库（data.ingest）"""
         try:
             parsed_limit = int(limit)
         except Exception:

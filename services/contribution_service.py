@@ -2,8 +2,10 @@
 智能贡献引导服务 - 自动检测贡献意图并引导PR流程
 """
 
-import re
 import asyncio
+import json
+import re
+import shlex
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
@@ -138,14 +140,312 @@ class ContributionService:
 
     def __init__(
         self,
+        plugin: Any = None,
+        agent_client: Any = None,
         default_target_org: str = "HITSZ-OpenAuto",
         session_timeout_minutes: int = 30,
     ):
+        self.plugin = plugin
+        self.agent_client = agent_client
         self.default_target_org = default_target_org
         self.session_timeout = session_timeout_minutes * 60  # 转换为秒
         self._sessions: Dict[str, ContributionSession] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
+
+    def _usage(self) -> str:
+        return (
+            "📝 贡献命令用法\n"
+            "1) 引导模式: /hit contribute\n"
+            "2) 预览: /hit contribute mode=preview campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content=讲解很清晰 semester=2026春\n"
+            "3) 提交: /hit contribute mode=submit campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content=讲解很清晰 semester=2026春\n"
+            "提示: 含空格内容建议用双引号，如 content=\"给分友好，作业适中\""
+        )
+
+    def _parse_payload(self, content: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        text = (content or "").strip()
+        if not text:
+            return {}, None
+
+        if text.startswith("{"):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict):
+                    return obj, None
+                return None, "JSON 顶层必须是对象"
+            except Exception as e:
+                return None, f"JSON 解析失败: {e}"
+
+        try:
+            tokens = shlex.split(text)
+        except Exception as e:
+            return None, f"参数解析失败: {e}"
+
+        data: Dict[str, Any] = {}
+        for tok in tokens:
+            if "=" not in tok:
+                continue
+            k, v = tok.split("=", 1)
+            key = k.strip().lower()
+            val = v.strip()
+            if key:
+                data[key] = val
+        return data, None
+
+    def _extract_toml(self, output: Dict[str, Any]) -> str:
+        if not isinstance(output, dict):
+            return ""
+        for key in ("readme_toml",):
+            v = output.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+        data = output.get("data")
+        if isinstance(data, dict):
+            v = data.get("readme_toml")
+            if isinstance(v, str) and v.strip():
+                return v
+            result = data.get("result")
+            if isinstance(result, dict):
+                v = result.get("readme_toml")
+                if isinstance(v, str) and v.strip():
+                    return v
+        result = output.get("result")
+        if isinstance(result, dict):
+            v = result.get("readme_toml")
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+
+    async def _is_multi_project(self, campus: str, course_code: str) -> bool:
+        if not self.agent_client:
+            return False
+        detail = await self.agent_client.get_course_detail(
+            course_code=course_code,
+            campus=campus,
+            include_toml=True,
+        )
+        if not detail.success:
+            return False
+        toml_text = self._extract_toml(detail.output or {})
+        if not toml_text:
+            return False
+        return 'repo_type = "multi-project"' in toml_text.lower()
+
+    def _build_ops(self, payload: Dict[str, Any], is_multi: bool) -> tuple[List[Dict[str, Any]], str]:
+        course_code = str(payload.get("course_code", "")).strip()
+        course_name = str(payload.get("course_name", "")).strip() or course_code
+        teacher = str(payload.get("teacher", "")).strip()
+        content = str(payload.get("content", "")).strip()
+        semester = str(payload.get("semester", "")).strip()
+        section_title = str(payload.get("section_title", "")).strip() or "课程评价"
+
+        op_content = content
+        if semester:
+            op_content += f"\n\n学期: {semester}"
+
+        if is_multi:
+            if teacher:
+                return (
+                    [
+                        {
+                            "op": "add_course_teacher_review",
+                            "course_name": course_name,
+                            "teacher_name": teacher,
+                            "content": op_content,
+                        }
+                    ],
+                    "add_course_teacher_review",
+                )
+            return (
+                [
+                    {
+                        "op": "append_course_section_item",
+                        "course_name": course_name,
+                        "section_title": section_title,
+                        "item": {"content": op_content},
+                    }
+                ],
+                "append_course_section_item",
+            )
+
+        return (
+            [
+                {
+                    "op": "add_lecturer_review",
+                    "lecturer_name": teacher or "匿名",
+                    "content": op_content,
+                }
+            ],
+            "add_lecturer_review",
+        )
+
+    def _pick_submit_meta(self, output: Dict[str, Any]) -> tuple[str, str]:
+        if not isinstance(output, dict):
+            return "", ""
+        pr_number = ""
+        pr_url = ""
+        pr_number = str(output.get("pr_number") or "").strip()
+        pr_url = str(output.get("pr_url") or "").strip()
+        if pr_number or pr_url:
+            return pr_number, pr_url
+        data = output.get("data")
+        if isinstance(data, dict):
+            pr = data.get("pr")
+            if isinstance(pr, dict):
+                pr_number = str(pr.get("number") or "").strip()
+                pr_url = str(pr.get("url") or "").strip()
+                return pr_number, pr_url
+        return "", ""
+
+    async def handle_contribute_command(self, event: Any, content: str) -> None:
+        text = (content or "").strip()
+        if not text:
+            await self.guide_contribution(event, None)
+            return
+
+        if text.lower() in {"help", "-h", "--help"}:
+            await event.send(event.plain_result(self._usage()))
+            return
+
+        payload, err = self._parse_payload(text)
+        if err:
+            await event.send(event.plain_result(f"❌ {err}\n\n{self._usage()}"))
+            return
+        if payload is None:
+            await event.send(event.plain_result(f"❌ 参数为空\n\n{self._usage()}"))
+            return
+
+        mode = str(payload.get("mode", "preview")).strip().lower()
+        campus = str(payload.get("campus", "shenzhen")).strip().lower() or "shenzhen"
+        course_code = str(payload.get("course_code", "")).strip()
+        content_text = str(payload.get("content", "")).strip()
+        if not course_code or not content_text:
+            await event.send(
+                event.plain_result(
+                    "❌ 缺少必填参数: course_code / content\n\n" + self._usage()
+                )
+            )
+            return
+
+        if mode not in {"preview", "submit"}:
+            await event.send(event.plain_result("❌ mode 仅支持 preview 或 submit"))
+            return
+
+        is_multi = await self._is_multi_project(campus=campus, course_code=course_code)
+        ops, op_name = self._build_ops(payload, is_multi=is_multi)
+
+        if mode == "preview":
+            if not self.agent_client:
+                await event.send(event.plain_result("❌ agent_client 未初始化"))
+                return
+            resp = await self.agent_client.preview_pr(
+                campus=campus,
+                course_code=course_code,
+                ops=ops,
+            )
+            if not resp.success:
+                msg = (resp.error or {}).get("message", "未知错误")
+                await event.send(event.plain_result(f"❌ 预览失败: {msg}"))
+                return
+            preview_text = ""
+            out = resp.output or {}
+            result = out.get("result") if isinstance(out, dict) else None
+            if isinstance(result, dict):
+                preview_text = str(result.get("readme_md") or "")
+            if not preview_text and isinstance(out, dict):
+                preview_text = str(out.get("readme_md") or "")
+            preview_text = preview_text.strip()
+            if len(preview_text) > 500:
+                preview_text = preview_text[:500] + "..."
+            msg = (
+                f"✅ 预览成功\n"
+                f"- campus: {campus}\n"
+                f"- course_code: {course_code}\n"
+                f"- repo_mode: {'multi-project' if is_multi else 'normal'}\n"
+                f"- applied_op: {op_name}\n"
+            )
+            if preview_text:
+                msg += f"\nREADME 预览片段:\n{preview_text}"
+            await event.send(event.plain_result(msg))
+            return
+
+        # submit
+        if not self.agent_client:
+            await event.send(event.plain_result("❌ agent_client 未初始化"))
+            return
+        idem = str(payload.get("idempotency_key", "")).strip()
+        if not idem:
+            idem = f"hit-{campus}-{course_code}-{int(datetime.now().timestamp())}"
+        resp = await self.agent_client.submit_pr(
+            campus=campus,
+            course_code=course_code,
+            ops=ops,
+            idempotency_key=idem,
+        )
+        if not resp.success:
+            msg = (resp.error or {}).get("message", "未知错误")
+            await event.send(event.plain_result(f"❌ 提交失败: {msg}"))
+            return
+
+        pr_number, pr_url = self._pick_submit_meta(resp.output or {})
+        msg = (
+            f"✅ 提交成功\n"
+            f"- campus: {campus}\n"
+            f"- course_code: {course_code}\n"
+            f"- repo_mode: {'multi-project' if is_multi else 'normal'}\n"
+            f"- applied_op: {op_name}\n"
+            f"- idempotency_key: {idem}"
+        )
+        if pr_number:
+            msg += f"\n- pr_number: {pr_number}"
+        if pr_url:
+            msg += f"\n- pr_url: {pr_url}"
+        await event.send(event.plain_result(msg))
+
+    async def guide_contribution(self, event: Any, intent_result: Any) -> None:
+        """引导用户进入贡献流程（最小可用版本）。"""
+        try:
+            user_id = str(event.get_sender_id())
+        except Exception:
+            user_id = "unknown"
+
+        group_id: Optional[str] = None
+        try:
+            if event.is_group_chat():
+                group_id = str(event.get_group_id())
+        except Exception:
+            group_id = None
+
+        extracted: Dict[str, Any] = {}
+        if intent_result is not None:
+            extracted = getattr(intent_result, "extracted_info", {}) or {}
+
+        raw_text = ""
+        try:
+            raw_text = event.get_message_outline() or ""
+        except Exception:
+            raw_text = ""
+
+        has_intent, detected_type, _ = self.detect_contribution_intent(raw_text)
+        if not has_intent:
+            detected_type = ContributionType.COURSE_REVIEW
+
+        session = await self.create_session(
+            user_id=user_id,
+            group_id=group_id,
+            contribution_type=detected_type,
+        )
+
+        if extracted:
+            await self.update_session(session.session_id, extracted)
+
+        await self.advance_step(session.session_id, ContributionStep.COLLECTING_INFO)
+        latest = await self.get_session(session.session_id)
+        if latest is None:
+            return
+
+        msg = self.generate_guidance_message(latest)
+        await event.send(event.plain_result(msg))
 
     async def start(self):
         """启动服务"""

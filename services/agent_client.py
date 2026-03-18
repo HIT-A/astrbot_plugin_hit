@@ -2,7 +2,6 @@
 Agent Backend HTTP客户端 - 调用agent-backend的技能API
 """
 
-import json
 import asyncio
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -97,9 +96,16 @@ class AgentClient:
 
                 # 解析响应
                 if data.get("ok", False):
+                    output = data.get("output")
+                    # New async skills may return job_id without output payload.
+                    if output is None and data.get("job_id"):
+                        output = {
+                            "job_id": data.get("job_id"),
+                            "status": "queued",
+                        }
                     return AgentResponse(
                         success=True,
-                        output=data.get("output"),
+                        output=output,
                         raw_response=data,
                     )
                 else:
@@ -163,19 +169,26 @@ class AgentClient:
         self,
         course_code: str,
         campus: str = "shenzhen",
+        include_toml: bool = False,
     ) -> AgentResponse:
         """
         获取课程详情
 
         Args:
             course_code: 课程代码
+            campus: 校区
+            include_toml: 是否返回 readme_toml
 
         Returns:
             AgentResponse
         """
         return await self.invoke_skill(
             "course.read",
-            {"campus": campus, "course_code": course_code},
+            {
+                "campus": campus,
+                "course_code": course_code,
+                "include_toml": include_toml,
+            },
         )
 
     async def search_files(
@@ -256,6 +269,8 @@ class AgentClient:
         ratings: Optional[Dict[str, int]] = None,
         semester: Optional[str] = None,
         teacher: Optional[str] = None,
+        campus: str = "shenzhen",
+        idempotency_key: Optional[str] = None,
     ) -> AgentResponse:
         """
         提交课程评价
@@ -270,18 +285,31 @@ class AgentClient:
         Returns:
             AgentResponse
         """
-        input_data = {
-            "course_code": course_code,
-            "content": content,
-        }
+        op_content = content
         if ratings:
-            input_data["ratings"] = ratings
+            op_content += (
+                f"\n\n评分: 内容{ratings.get('content', '-')}/5, "
+                f"教学{ratings.get('teaching', '-')}/5, "
+                f"总体{ratings.get('overall', '-')}/5"
+            )
         if semester:
-            input_data["semester"] = semester
-        if teacher:
-            input_data["teacher"] = teacher
+            op_content += f"\n学期: {semester}"
 
-        return await self.invoke_skill("reviews.submit", input_data)
+        input_data = {
+            "campus": campus,
+            "course_code": course_code,
+            "ops": [
+                {
+                    "op": "add_lecturer_review",
+                    "lecturer_name": teacher or "匿名",
+                    "content": op_content,
+                }
+            ],
+        }
+        if idempotency_key:
+            input_data["idempotency_key"] = idempotency_key
+
+        return await self.invoke_skill("pr.submit", input_data)
 
     async def create_pr(
         self,
@@ -306,17 +334,62 @@ class AgentClient:
         Returns:
             AgentResponse
         """
-        input_data = {
-            "title": title,
-            "content": content,
-            "target_org": target_org,
-            "target_repo": target_repo,
-            "branch": branch,
-        }
-        if files:
-            input_data["files"] = files
+        return AgentResponse(
+            success=False,
+            error={
+                "message": (
+                    "github.create_pr 已下线，请改用 pr.submit（课程变更）"
+                    "或在调用方直接走 GitHub API。"
+                )
+            },
+        )
 
-        return await self.invoke_skill("github.create_pr", input_data)
+    async def preview_pr(
+        self,
+        campus: str,
+        course_code: str,
+        ops: List[Dict[str, Any]],
+    ) -> AgentResponse:
+        """调用 pr.preview 预览课程变更。"""
+        return await self.invoke_skill(
+            "pr.preview",
+            {
+                "campus": campus,
+                "course_code": course_code,
+                "ops": ops,
+            },
+        )
+
+    async def submit_pr(
+        self,
+        campus: str,
+        course_code: str,
+        ops: List[Dict[str, Any]],
+        idempotency_key: Optional[str] = None,
+        pr: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
+        """调用 pr.submit 提交课程改动。"""
+        input_data: Dict[str, Any] = {
+            "campus": campus,
+            "course_code": course_code,
+            "ops": ops,
+        }
+        if idempotency_key:
+            input_data["idempotency_key"] = idempotency_key
+        if pr:
+            input_data["pr"] = pr
+        return await self.invoke_skill("pr.submit", input_data)
+
+    async def lookup_pr(self, org: str, repo: str, number: int) -> AgentResponse:
+        """调用 pr.lookup 查询 PR 状态。"""
+        return await self.invoke_skill(
+            "pr.lookup",
+            {
+                "org": org,
+                "repo": repo,
+                "number": number,
+            },
+        )
 
     async def health_check(self) -> bool:
         """
