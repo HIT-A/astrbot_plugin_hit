@@ -1582,7 +1582,7 @@ class HITPlugin(Star):
 
         gid = str(group_id)
         visited_folders = set()
-        folder_queue = ["/", "root", "0", ""]
+        folder_queue = ["/", "root", "0"]
         all_files: List[Dict[str, Any]] = []
         seen_keys = set()
 
@@ -1640,11 +1640,15 @@ class HITPlugin(Star):
                 if fid not in visited_folders and fid not in folder_queue:
                     folder_queue.append(fid)
 
-        debug_log(
-            f"群文件枚举完成: group_id={gid}, files={len(all_files)}, visited_folders={len(visited_folders)}",
-            "INFO",
-        )
-        return all_files
+            debug_log(
+                f"群文件枚举完成: group_id={gid}, files={len(all_files)}, visited_folders={len(visited_folders)}, folder_queue_remaining={len(folder_queue)}",
+                "INFO",
+            )
+            debug_log(
+                f"文件列表: {[f.get('file_name', '?') for f in all_files]}",
+                "DEBUG",
+            )
+            return all_files
 
     async def _napcat_download_group_file(
         self, event: AstrMessageEvent, file_ref: Dict[str, str]
