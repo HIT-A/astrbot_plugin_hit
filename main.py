@@ -1445,6 +1445,7 @@ class HITPlugin(Star):
         def _extract_files_and_folders(data: Dict[str, Any]) -> tuple:
             files_raw: List[Dict[str, Any]] = []
             folders_raw: List[Dict[str, Any]] = []
+            seen_file_ids = set()
 
             file_keys = ["files", "file_list", "fileList", "items", "records", "list"]
             folder_keys = [
@@ -1473,7 +1474,11 @@ class HITPlugin(Star):
                             if is_folder:
                                 folders_raw.append(row)
                             else:
-                                files_raw.append(row)
+                                # 去重：基于 file_id
+                                fid = str(row.get("file_id") or row.get("fid") or row.get("id") or "")
+                                if fid and fid not in seen_file_ids:
+                                    seen_file_ids.add(fid)
+                                    files_raw.append(row)
 
             for k in folder_keys:
                 v = data.get(k)
