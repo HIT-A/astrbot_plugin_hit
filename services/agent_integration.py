@@ -551,6 +551,12 @@ class HITAgentTools:
             # 预估时间：每个文件约10秒
             est_time = count * 10
 
+            from astrbot import logger
+
+            logger.info(
+                f"[scan_group_files] 预获取文件列表: 总数={len(file_list)}, 有效文件={len(valid_files)}, 文件名={[f.get('file_name', '?') for f in valid_files]}"
+            )
+
             if count == 0:
                 return "没有找到支持的文件类型（PDF/Word/PPT/TXT/MD/Excel）"
 
