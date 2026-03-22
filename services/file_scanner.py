@@ -735,17 +735,19 @@ class FileScannerService:
     async def scan_and_ingest_group_files(
         self,
         group_id: str,
-        get_file_list_func: Callable[..., Any],
-        download_file_func: Callable[..., Any],
+        get_file_list_func: Callable[..., Any] = None,
+        download_file_func: Callable[..., Any] = None,
         limit: int = 20,
+        file_list: List[Any] = None,
     ) -> IngestResult:
         """扫描群文件并直接入库（一步完成）
 
         Args:
             group_id: 群ID
-            get_file_list_func: 获取文件列表的回调函数
+            get_file_list_func: 获取文件列表的回调函数（file_list为空时使用）
             download_file_func: 下载文件的回调函数
             limit: 单次处理文件数量限制
+            file_list: 可选，预获取的文件列表（避免重复获取）
 
         Returns:
             IngestResult: 入库结果
@@ -765,11 +767,9 @@ class FileScannerService:
 
         logger.info(f"开始扫描并入库群文件: group_id={group_id}")
 
-        # Step 1: 获取文件列表
-        try:
-            file_list = await self._invoke_callback(get_file_list_func, group_id)
-            if not file_list:
-                logger.info(f"群 {group_id} 没有文件")
+        # Step 1: 获取文件列表（如果有预获取的则使用，否则调用回调）
+        if file_list is None:
+            if get_file_list_func is None:
                 return IngestResult(
                     total_candidates=0,
                     ingested_files=0,
@@ -777,19 +777,32 @@ class FileScannerService:
                     skipped_files=0,
                     ingest_time=now,
                     details=[],
-                    error_message="群文件列表为空",
+                    error_message="未提供文件列表获取方式",
                 )
-        except Exception as e:
-            logger.warning(f"获取群文件列表失败: {e}")
-            return IngestResult(
-                total_candidates=0,
-                ingested_files=0,
-                failed_files=0,
-                skipped_files=0,
-                ingest_time=now,
-                details=[],
-                error_message=f"获取文件列表失败: {e}",
-            )
+            try:
+                file_list = await self._invoke_callback(get_file_list_func, group_id)
+                if not file_list:
+                    logger.info(f"群 {group_id} 没有文件")
+                    return IngestResult(
+                        total_candidates=0,
+                        ingested_files=0,
+                        failed_files=0,
+                        skipped_files=0,
+                        ingest_time=now,
+                        details=[],
+                        error_message="群文件列表为空",
+                    )
+            except Exception as e:
+                logger.warning(f"获取群文件列表失败: {e}")
+                return IngestResult(
+                    total_candidates=0,
+                    ingested_files=0,
+                    failed_files=0,
+                    skipped_files=0,
+                    ingest_time=now,
+                    details=[],
+                    error_message=f"获取文件列表失败: {e}",
+                )
 
         # Step 2: 遍历文件，上传到 COS 并自动入库 Qdrant
         processed = 0

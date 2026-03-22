@@ -562,9 +562,9 @@ class HITAgentTools:
 
             result = await self.file_scanner.scan_and_ingest_group_files(
                 group_id,
-                get_file_list_func=_list_cb,
                 download_file_func=_download_cb,
                 limit=limit,
+                file_list=valid_files,
             )
 
             if result.error_message:
