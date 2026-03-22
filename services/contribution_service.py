@@ -159,10 +159,12 @@ class ContributionService:
             "1) 引导模式: /hit contribute\n"
             "2) 预览: /hit contribute mode=preview campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content=讲解很清晰 semester=2026春\n"
             "3) 提交: /hit contribute mode=submit campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content=讲解很清晰 semester=2026春\n"
-            "提示: 含空格内容建议用双引号，如 content=\"给分友好，作业适中\""
+            '提示: 含空格内容建议用双引号，如 content="给分友好，作业适中"'
         )
 
-    def _parse_payload(self, content: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    def _parse_payload(
+        self, content: str
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
         text = (content or "").strip()
         if not text:
             return {}, None
@@ -231,7 +233,9 @@ class ContributionService:
             return False
         return 'repo_type = "multi-project"' in toml_text.lower()
 
-    def _build_ops(self, payload: Dict[str, Any], is_multi: bool) -> tuple[List[Dict[str, Any]], str]:
+    def _build_ops(
+        self, payload: Dict[str, Any], is_multi: bool
+    ) -> tuple[List[Dict[str, Any]], str]:
         course_code = str(payload.get("course_code", "")).strip()
         course_name = str(payload.get("course_name", "")).strip() or course_code
         teacher = str(payload.get("teacher", "")).strip()
@@ -347,13 +351,29 @@ class ContributionService:
                 msg = (resp.error or {}).get("message", "未知错误")
                 await event.send(event.plain_result(f"❌ 预览失败: {msg}"))
                 return
+
+            # pr.preview 是异步，需要轮询 job
+            job_id = (
+                resp.output.get("job_id") if isinstance(resp.output, dict) else None
+            )
+            if not job_id:
+                await event.send(event.plain_result("❌ 预览失败: 未获取到 job_id"))
+                return
+
+            try:
+                await event.send(event.plain_result("⏳ 正在生成预览，请稍候..."))
+                job_result = await self.agent_client.wait_for_job(job_id, timeout=60.0)
+            except TimeoutError:
+                await event.send(event.plain_result("❌ 预览超时，请重试"))
+                return
+            except RuntimeError as e:
+                await event.send(event.plain_result(f"❌ 预览失败: {e}"))
+                return
+
             preview_text = ""
-            out = resp.output or {}
-            result = out.get("result") if isinstance(out, dict) else None
+            result = job_result.get("result") if isinstance(job_result, dict) else None
             if isinstance(result, dict):
                 preview_text = str(result.get("readme_md") or "")
-            if not preview_text and isinstance(out, dict):
-                preview_text = str(out.get("readme_md") or "")
             preview_text = preview_text.strip()
             if len(preview_text) > 500:
                 preview_text = preview_text[:500] + "..."
@@ -387,7 +407,24 @@ class ContributionService:
             await event.send(event.plain_result(f"❌ 提交失败: {msg}"))
             return
 
-        pr_number, pr_url = self._pick_submit_meta(resp.output or {})
+        # pr.submit 是异步，需要轮询 job
+        job_id = resp.output.get("job_id") if isinstance(resp.output, dict) else None
+        if not job_id:
+            await event.send(event.plain_result("❌ 提交失败: 未获取到 job_id"))
+            return
+
+        try:
+            await event.send(event.plain_result("⏳ 正在提交 PR，请稍候..."))
+            job_result = await self.agent_client.wait_for_job(job_id, timeout=60.0)
+        except TimeoutError:
+            await event.send(event.plain_result("❌ 提交超时，请重试"))
+            return
+        except RuntimeError as e:
+            await event.send(event.plain_result(f"❌ 提交失败: {e}"))
+            return
+
+        pr_number = str(job_result.get("pr_number") or "")
+        pr_url = str(job_result.get("pr_url") or "")
         msg = (
             f"✅ 提交成功\n"
             f"- campus: {campus}\n"

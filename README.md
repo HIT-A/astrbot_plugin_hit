@@ -86,14 +86,19 @@ astrbot_plugin_hit/
 
 ## 2.4 配置读取
 - 通过 `core/config.py` 读取以下环境变量（`HITSZ_*` 前缀）：
-    - `HITSZ_GEMINI_API_KEY`
-    - `HITSZ_GEMINI_MODEL`
+    - `HITSZ_AI_API_KEY`
+    - `HITSZ_AI_BASE_URL`（默认 `https://api.minimaxi.com`）
+    - `HITSZ_AI_INTENT_MODEL`（默认 `M2-her`）
+    - `HITSZ_AI_COMPLEX_MODEL`（默认 `M2-her`）
     - `HITSZ_AGENT_BACKEND_URL`
     - `HITSZ_AGENT_BACKEND_API_KEY`
     - `HITSZ_INTENT_CHECK_INTERVAL`
     - `HITSZ_DAILY_SUMMARY_TIME`
     - `HITSZ_MAX_FILE_SIZE_MB`
     - `HITSZ_CONTEXT_WINDOW_MINUTES`
+
+兼容说明：
+- 仍可读取旧变量 `HITSZ_GLM_*` 作为兜底。
 
 ## 3. 使用命令
 

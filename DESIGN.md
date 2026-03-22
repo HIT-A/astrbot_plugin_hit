@@ -15,7 +15,7 @@
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│           Gemini 2.5 Flash (意图判断)                        │
+│           GLM 4.7 Flash (意图判断)                           │
 │  额度: 250次/天                                              │
 │  频率: 每3分钟判断一次（有新增上文时）                         │
 │  功能:                                                        │
@@ -43,7 +43,7 @@
     └─────────────────────────────────────────┘
 ```
 
-## 2. 意图判断模块 (Gemini 2.5 Flash)
+## 2. 意图判断模块 (GLM 4.7 Flash)
 
 ### 2.1 激活策略
 
@@ -104,7 +104,7 @@
 }
 ```
 
-### 2.3 Gemini Prompt 设计
+### 2.3 GLM Prompt 设计
 
 ```
 你是一个意图识别助手。请分析以下对话上下文，判断用户的真实意图。
@@ -252,7 +252,7 @@
 尤其是根轨迹那部分，很清晰。"
     │
     ▼
-Gemini识别:
+GLM识别:
 - intent: contribution
 - type: course_review
 - course: 自动控制原理
@@ -385,9 +385,11 @@ def deep_search(query, file_type="auto"):
 ## 6. 配置项
 
 ```yaml
-# Gemini配置
-HITSZ_GEMINI_API_KEY=your_gemini_api_key
-HITSZ_GEMINI_MODEL=gemini-2.5-flash-preview-05-20
+# GLM配置
+HITSZ_GLM_API_KEY=your_glm_api_key
+HITSZ_GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+HITSZ_GLM_INTENT_MODEL=glm-4.7-flash
+HITSZ_GLM_COMPLEX_MODEL=glm-5
 
 # Agent Backend
 HITSZ_AGENT_BACKEND_URL=http://localhost:8080
@@ -456,7 +458,7 @@ class MessageQueue:
 ## 8. 更新日志
 
 ### v3.0.0 (2025-03-16)
-- 使用 Gemini 2.5 Flash 进行意图判断
+- 使用 GLM 4.7 Flash 进行意图判断
 - 3分钟滑动窗口上下文管理
 - 全自动群文件处理（无需实时确认）
 - 每日总结需管理员确认
