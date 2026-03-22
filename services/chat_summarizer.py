@@ -94,13 +94,15 @@ class ChatSummarizerService:
 
     def __init__(
         self,
-        gemini_api_key: str,
-        gemini_model: str = "gemini-2.5-flash-preview-05-20",
+        api_key: str,
+        model: str = "MiniMax-M2.7",
+        base_url: str = "https://api.minimaxi.com",
         summary_time: str = "22:30",
         min_educational_score: float = 0.6,
     ):
-        self.gemini_api_key = gemini_api_key
-        self.gemini_model = gemini_model
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
         self.summary_time = summary_time
         self.min_educational_score = min_educational_score
         self._pending_summaries: Dict[str, DailySummary] = {}  # 待确认总结
@@ -252,7 +254,7 @@ class ChatSummarizerService:
         hot_topics = []
         key_questions = []
 
-        if use_ai and self.gemini_api_key and educational_messages:
+        if use_ai and self.api_key and educational_messages:
             try:
                 ai_summary = await self._generate_ai_summary(educational_messages)
                 summary_text = ai_summary.get("summary", "")
@@ -312,20 +314,41 @@ class ChatSummarizerService:
 2. 提取有价值的问题和讨论
 3. 总结要简洁明了"""
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent",
-                headers={"Content-Type": "application/json"},
-                params={"key": self.gemini_api_key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json"},
-                },
-            )
+        url = f"{self.base_url}/v1/text/chatcompletion_v2"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "name": "MiniMax AI"},
+                {"role": "user", "content": prompt, "name": "用户"},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
+
+        text = None
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(msg, dict):
+                text = msg.get("content")
+
+        if not text and isinstance(data, dict):
+            text = data.get("reply") or data.get("output")
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"MiniMax响应缺少可解析文本: keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+        text = text.strip()
+        return json.loads(text)
 
     def _generate_simple_summary(self, messages: List[ChatMessage]) -> str:
         """生成简单总结（无AI时）"""
@@ -416,5 +439,5 @@ class ChatSummarizerService:
             "running": self._running,
             "summary_time": self.summary_time,
             "pending_summaries": len(self._pending_summaries),
-            "api_configured": bool(self.gemini_api_key),
+            "api_configured": bool(self.api_key),
         }

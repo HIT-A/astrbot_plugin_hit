@@ -1,7 +1,7 @@
 """
-Intent Classification Service - Using Gemini Flash for cheap intent classification
+Intent Classification Service - Using GLM Flash for cheap intent classification
 
-This module provides intent classification using Gemini Flash to filter out
+This module provides intent classification using GLM Flash to filter out
 chat/noise and route valid intents to the main agent.
 """
 
@@ -48,9 +48,9 @@ class IntentResult:
 
 
 class IntentClassifier:
-    """Intent classifier using Gemini Flash.
+    """Intent classifier using GLM Flash.
 
-    This service uses the cheap Gemini Flash model to classify user intents
+    This service uses the cheap GLM Flash model to classify user intents
     and filter out chat/noise, saving costs on the expensive main agent.
     """
 
@@ -61,9 +61,10 @@ class IntentClassifier:
             config: Plugin configuration
         """
         self.config = config
-        self.api_key = config.gemini_api_key
-        self.model = config.gemini_model
-        self.daily_quota = config.gemini_daily_quota
+        self.api_key = config.glm_api_key
+        self.model = config.glm_intent_model
+        self.base_url = config.glm_base_url.rstrip("/")
+        self.daily_quota = config.glm_daily_quota
 
         # Quota tracking
         self._calls_today = 0
@@ -92,7 +93,7 @@ class IntentClassifier:
                 self._calls_today = 0
                 self._last_reset_date = today
                 logger.info(
-                    f"Gemini quota reset: {self._calls_today}/{self.daily_quota}"
+                    f"GLM quota reset: {self._calls_today}/{self.daily_quota}"
                 )
 
     async def _consume_quota(self) -> bool:
@@ -106,14 +107,14 @@ class IntentClassifier:
         async with self._quota_lock:
             if self._calls_today >= self.daily_quota:
                 logger.warning(
-                    f"Gemini daily quota exhausted: {self._calls_today}/{self.daily_quota}"
+                    f"GLM daily quota exhausted: {self._calls_today}/{self.daily_quota}"
                 )
                 return False
 
             self._calls_today += 1
             remaining = self.daily_quota - self._calls_today
             logger.debug(
-                f"Gemini call: {self._calls_today}/{self.daily_quota}, remaining: {remaining}"
+                f"GLM call: {self._calls_today}/{self.daily_quota}, remaining: {remaining}"
             )
             return True
 
@@ -142,7 +143,7 @@ class IntentClassifier:
 
         # Check API key
         if not self.api_key:
-            logger.error("Gemini API key not configured")
+            logger.error("GLM API key not configured")
             return IntentResult(
                 has_valid_intent=False,
                 intent=IntentType.CHAT,
@@ -155,8 +156,8 @@ class IntentClassifier:
             # Build context from messages
             context_text = self._build_context(messages)
 
-            # Call Gemini API
-            result = await self._call_gemini(context_text)
+            # Call GLM API
+            result = await self._call_glm(context_text)
 
             # Check confidence
             if result.confidence < min_confidence:
@@ -214,8 +215,8 @@ class IntentClassifier:
             lines.append(f"{sender}: {content}")
         return "\n".join(lines)
 
-    async def _call_gemini(self, context_text: str) -> IntentResult:
-        """Call Gemini API for intent classification.
+    async def _call_glm(self, context_text: str) -> IntentResult:
+        """Call GLM API for intent classification.
 
         Args:
             context_text: Context text to classify
@@ -258,22 +259,29 @@ Notes:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
-                headers={"Content-Type": "application/json"},
-                params={"key": self.api_key},
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
                 json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "temperature": 0.3,
-                    },
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "thinking": {"type": "enabled"},
+                    "max_tokens": 2048,
+                    "temperature": 0.3,
                 },
             )
             resp.raise_for_status()
             data = resp.json()
 
             # Parse response
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            choices = data.get("choices") or []
+            if not choices:
+                raise ValueError("GLM response missing choices")
+            text = (choices[0].get("message") or {}).get("content")
+            if not text:
+                raise ValueError("GLM response missing message.content")
             result_json = json.loads(text)
 
             # Map intent string to enum
