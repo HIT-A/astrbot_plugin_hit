@@ -1588,6 +1588,7 @@ class HITPlugin(Star):
 
         # 先尝试根目录接口（部分实现只支持这个）
         root_actions = ["get_group_root_files", "get_group_file_list"]
+        root_success = False
         for action in root_actions:
             data = await _call_and_parse(action, {"group_id": gid})
             if not isinstance(data, dict):
@@ -1601,6 +1602,11 @@ class HITPlugin(Star):
             for fid in _extract_folder_ids(folders_raw):
                 if fid not in visited_folders and fid not in folder_queue:
                     folder_queue.append(fid)
+            # 如果这次调用返回了文件，就认为成功了，跳过下一个
+            if files_raw:
+                debug_log(f"根目录扫描使用: {action}, files={len(files_raw)}", "DEBUG")
+                root_success = True
+                break
 
         # 递归扫描子目录
         while folder_queue:
