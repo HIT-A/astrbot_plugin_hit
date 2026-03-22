@@ -521,6 +521,45 @@ class HITAgentTools:
                     {"file_id": str(file_ref), "file_name": str(file_ref)},
                 )
 
+            # 先获取文件列表，汇报数量和预估时间
+            file_list = await _list_cb(group_id)
+            if not file_list:
+                return "群文件列表为空"
+
+            # 过滤支持的文件类型
+            from urllib.parse import urlparse
+
+            supported_exts = {
+                ".pdf",
+                ".doc",
+                ".docx",
+                ".ppt",
+                ".pptx",
+                ".txt",
+                ".md",
+                ".xls",
+                ".xlsx",
+            }
+            valid_files = []
+            for f in file_list:
+                fname = f.get("file_name", "")
+                ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+                if ext in supported_exts:
+                    valid_files.append(f)
+
+            count = min(len(valid_files), limit)
+            # 预估时间：每个文件约10秒
+            est_time = count * 10
+
+            if count == 0:
+                return "没有找到支持的文件类型（PDF/Word/PPT/TXT/MD/Excel）"
+
+            # 汇报后开始处理
+            report = (
+                f"发现 {len(valid_files)} 个文件，将处理前 {count} 个\n"
+                f"预估耗时约 {est_time} 秒，请稍候...\n"
+            )
+
             result = await self.file_scanner.scan_and_ingest_group_files(
                 group_id,
                 get_file_list_func=_list_cb,
@@ -532,8 +571,7 @@ class HITAgentTools:
                 return f"扫描入库失败: {result.error_message}"
 
             return (
-                f"📁 群文件扫描入库完成\n"
-                f"总文件: {result.total_candidates}\n"
+                f"{report}\n"
                 f"入库成功: {result.ingested_files}\n"
                 f"跳过: {result.skipped_files}\n"
                 f"失败: {result.failed_files}"
