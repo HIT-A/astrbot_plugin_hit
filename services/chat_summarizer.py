@@ -4,6 +4,7 @@
 
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
@@ -241,22 +242,21 @@ class ChatSummarizerService:
 
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # 分析消息
         analyzed_messages = await self.analyze_messages(messages)
 
-        # 统计信息
         total_messages = len(analyzed_messages)
         active_users = len(set(m.sender_id for m in analyzed_messages))
         educational_messages = [m for m in analyzed_messages if m.is_educational]
 
-        # 使用AI生成总结
         summary_text = ""
         hot_topics = []
         key_questions = []
 
         if use_ai and self.api_key and educational_messages:
             try:
-                ai_summary = await self._generate_ai_summary(educational_messages)
+                ai_summary = await self._generate_summary_json(
+                    self._build_summary_prompt(educational_messages)
+                )
                 summary_text = ai_summary.get("summary", "")
                 hot_topics = ai_summary.get("hot_topics", [])
                 key_questions = ai_summary.get("key_questions", [])
@@ -271,27 +271,34 @@ class ChatSummarizerService:
             group_id=group_id,
             total_messages=total_messages,
             active_users=active_users,
-            educational_content=educational_messages[:20],  # 最多保留20条
+            educational_content=educational_messages[:20],
             hot_topics=hot_topics,
             key_questions=key_questions,
             summary_text=summary_text,
         )
 
-        # 保存待确认
         async with self._lock:
             self._pending_summaries[group_id] = summary
 
         logger.info(f"✅ 群 {group_id} 每日总结生成完成")
         return summary
 
-    async def _generate_ai_summary(self, messages: List[ChatMessage]) -> Dict[str, Any]:
-        """使用AI生成总结"""
-        # 构建提示
-        context = "\n".join(
-            [f"{m.sender_name}: {m.content}" for m in messages[:50]]  # 最多50条
+    def _strip_reasoning_tags(self, text: str) -> str:
+        """移除 MiniMax 思考过程标签及其内容"""
+        if not text:
+            return text
+        reasoning_pattern = re.compile(
+            r"<\|MiniMax[_\s]?Reasoning\|>.*?<\|Assistant\|>", re.DOTALL
         )
+        text = reasoning_pattern.sub("", text)
+        thinking_boss_pattern = re.compile(r"<\|Thinking\|>.*?<\|Output\|>", re.DOTALL)
+        text = thinking_boss_pattern.sub("", text)
+        return text.strip()
 
-        prompt = f"""分析以下群聊消息，生成每日精华总结。
+    def _build_summary_prompt(self, messages: List[ChatMessage]) -> str:
+        """构建总结提示"""
+        context = "\n".join([f"{m.sender_name}: {m.content}" for m in messages[:50]])
+        return f"""分析以下群聊消息，生成每日精华总结。
 
 消息内容:
 {context}
@@ -313,6 +320,9 @@ class ChatSummarizerService:
 1. 重点关注学习、课程、考试相关的内容
 2. 提取有价值的问题和讨论
 3. 总结要简洁明了"""
+
+    async def _generate_summary_json(self, prompt: str) -> Dict[str, Any]:
+        """生成结构化总结（调用AI）"""
 
         url = f"{self.base_url}/v1/text/chatcompletion_v2"
         headers = {
@@ -345,9 +355,11 @@ class ChatSummarizerService:
             text = data.get("reply") or data.get("output")
 
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f"MiniMax响应缺少可解析文本: keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+            raise ValueError(
+                f"MiniMax响应缺少可解析文本: keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
+            )
 
-        text = text.strip()
+        text = self._strip_reasoning_tags(text).strip()
         return json.loads(text)
 
     def _generate_simple_summary(self, messages: List[ChatMessage]) -> str:

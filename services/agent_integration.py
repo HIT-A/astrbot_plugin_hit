@@ -45,7 +45,9 @@ class HITAgentTools:
                 return innermost
         return inner
 
-    async def _call_skill(self, skill_name: str, input_data: Dict[str, Any]) -> str:
+    async def _call_skill(
+        self, skill_name: str, input_data: Dict[str, Any], timeout: float = 60.0
+    ) -> str:
         """调用 agent-backend skill 并返回格式化结果"""
         try:
             resp = await self.agent_client.invoke_skill(skill_name, input_data)
@@ -60,7 +62,7 @@ class HITAgentTools:
                 job_id = output.get("job_id")
                 try:
                     job_result = await self.agent_client.wait_for_job(
-                        job_id, timeout=60.0
+                        job_id, timeout=timeout
                     )
                     return json.dumps(job_result, ensure_ascii=False, indent=2)
                 except TimeoutError:
@@ -331,17 +333,30 @@ class HITAgentTools:
         return await self._call_skill("mcp.list_tools", {"server": server})
 
     async def call_mcp_tool(
-        self, event, server: str, tool: str, arguments: Dict
+        self, event, server: str, tool_name: str, arguments: Dict
     ) -> str:
         """调用 MCP 工具
 
         Args:
             server: 服务器名称
-            tool: 工具名称
+            tool_name: 工具名称
             arguments: 工具参数
         """
         return await self._call_skill(
-            "mcp.call_tool", {"server": server, "tool": tool, "arguments": arguments}
+            "mcp.call_tool",
+            {"server": server, "tool": tool_name, "arguments": arguments},
+            timeout=450.0,
+        )
+
+    async def upload_local_file(self, event, local_path: str) -> str:
+        """上传本地文件到COS存储
+
+        Args:
+            local_path: 服务器上的本地文件路径
+        """
+        return await self._call_skill(
+            "files.upload_local",
+            {"path": local_path},
         )
 
     # ========== GitHub 相关 Tools ==========
@@ -752,12 +767,27 @@ def create_hit_tools(
                 "type": "object",
                 "properties": {
                     "server": {"type": "string", "description": "服务器名称"},
-                    "tool": {"type": "string", "description": "工具名称"},
+                    "tool_name": {"type": "string", "description": "工具名称"},
                     "arguments": {"type": "object", "description": "工具参数"},
                 },
-                "required": ["server", "tool"],
+                "required": ["server", "tool_name"],
             },
             handler=tools.call_mcp_tool,
+        ),
+        FunctionTool(
+            name="upload_local_file",
+            description="上传服务器本地文件到COS存储。当MCP工具下载文件后文件过大无法自动入库时，使用此工具上传到COS获取链接。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "local_path": {
+                        "type": "string",
+                        "description": "服务器上的本地文件路径",
+                    },
+                },
+                "required": ["local_path"],
+            },
+            handler=tools.upload_local_file,
         ),
         # COS存储
         FunctionTool(

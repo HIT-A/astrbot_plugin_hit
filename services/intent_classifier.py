@@ -92,9 +92,7 @@ class IntentClassifier:
             if today != self._last_reset_date:
                 self._calls_today = 0
                 self._last_reset_date = today
-                logger.info(
-                    f"GLM quota reset: {self._calls_today}/{self.daily_quota}"
-                )
+                logger.info(f"GLM quota reset: {self._calls_today}/{self.daily_quota}")
 
     async def _consume_quota(self) -> bool:
         """Consume one API call from the daily quota.
@@ -267,7 +265,7 @@ Notes:
                 json={
                     "model": self.model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "thinking": {"type": "enabled"},
+                    "thinking": {"type": "disabled"},
                     "max_tokens": 2048,
                     "temperature": 0.3,
                 },

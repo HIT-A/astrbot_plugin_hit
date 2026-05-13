@@ -252,7 +252,9 @@ class IntentService:
             )
 
         except json.JSONDecodeError as e:
-            logger.error(f"❌ AI响应JSON解析失败: {e}; 原始返回预览={self._preview_text_for_debug(text)}")
+            logger.error(
+                f"❌ AI响应JSON解析失败: {e}; 原始返回预览={self._preview_text_for_debug(text)}"
+            )
             return IntentResult(
                 has_valid_intent=False,
                 intent=IntentType.CHAT,
@@ -271,6 +273,18 @@ class IntentService:
                 reasoning="llm_call_failed_fallback_chat",
                 raw_response=None,
             )
+
+    def _strip_reasoning_tags(self, text: str) -> str:
+        """移除 MiniMax 思考过程标签及其内容"""
+        if not text:
+            return text
+        reasoning_pattern = re.compile(
+            r"<\|MiniMax[_\s]?Reasoning\|>.*?<\|Assistant\|>", re.DOTALL
+        )
+        text = reasoning_pattern.sub("", text)
+        thinking_boss_pattern = re.compile(r"<\|Thinking\|>.*?<\|Output\|>", re.DOTALL)
+        text = thinking_boss_pattern.sub("", text)
+        return text.strip()
 
     async def _chat_completion_json(
         self,
@@ -302,30 +316,33 @@ class IntentService:
 
         def _extract_text_from_content(content: Any) -> str:
             if isinstance(content, str):
-                return content.strip()
+                return self._strip_reasoning_tags(content).strip()
             if isinstance(content, list):
                 chunks: List[str] = []
                 for part in content:
                     if isinstance(part, str):
-                        if part.strip():
-                            chunks.append(part.strip())
+                        stripped = self._strip_reasoning_tags(part).strip()
+                        if stripped:
+                            chunks.append(stripped)
                         continue
                     if isinstance(part, dict):
                         txt = part.get("text") or part.get("content") or ""
                         if isinstance(txt, str) and txt.strip():
-                            chunks.append(txt.strip())
+                            chunks.append(self._strip_reasoning_tags(txt).strip())
                 return "\n".join([c for c in chunks if c])
             if isinstance(content, dict):
                 txt = content.get("text") or content.get("content") or ""
                 if isinstance(txt, str):
-                    return txt.strip()
+                    return self._strip_reasoning_tags(txt).strip()
             return ""
 
         # 兼容多种响应格式
         choices = data.get("choices") if isinstance(data, dict) else None
         if isinstance(choices, list) and choices:
             first_choice = choices[0] if isinstance(choices[0], dict) else {}
-            message = first_choice.get("message") if isinstance(first_choice, dict) else None
+            message = (
+                first_choice.get("message") if isinstance(first_choice, dict) else None
+            )
             if isinstance(message, dict):
                 text = _extract_text_from_content(message.get("content"))
                 if text:
@@ -334,26 +351,30 @@ class IntentService:
                 # 一些实现会把文本挂在 message.text
                 alt_text = message.get("text")
                 if isinstance(alt_text, str) and alt_text.strip():
-                    return alt_text.strip()
+                    return self._strip_reasoning_tags(alt_text).strip()
 
             # 某些实现会把文本直接放在 choice.text/output_text
             choice_text = first_choice.get("text") or first_choice.get("output_text")
             if isinstance(choice_text, str) and choice_text.strip():
-                return choice_text.strip()
+                return self._strip_reasoning_tags(choice_text).strip()
 
         reply = data.get("reply") if isinstance(data, dict) else None
         if isinstance(reply, str) and reply.strip():
-            return reply.strip()
+            return self._strip_reasoning_tags(reply).strip()
 
         output = data.get("output") if isinstance(data, dict) else None
         if isinstance(output, str) and output.strip():
-            return output.strip()
+            return self._strip_reasoning_tags(output).strip()
 
         keys = list(data.keys()) if isinstance(data, dict) else type(data)
         first_choice_preview = ""
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            first_choice_preview = self._preview_text_for_debug(json.dumps(choices[0], ensure_ascii=False))
-        raise ValueError(f"MiniMax响应缺少可解析文本: keys={keys}; first_choice={first_choice_preview}")
+            first_choice_preview = self._preview_text_for_debug(
+                json.dumps(choices[0], ensure_ascii=False)
+            )
+        raise ValueError(
+            f"MiniMax响应缺少可解析文本: keys={keys}; first_choice={first_choice_preview}"
+        )
 
     def _parse_json_payload(self, text: str) -> Dict[str, Any]:
         """尽量从模型输出中解析 JSON 对象。"""
@@ -431,7 +452,9 @@ class IntentService:
         candidates.append(normalized)
 
         # 代码块提取（```json ... ``` / ``` ... ```）
-        fence_hits = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", normalized, flags=re.IGNORECASE)
+        fence_hits = re.findall(
+            r"```(?:json)?\s*([\s\S]*?)\s*```", normalized, flags=re.IGNORECASE
+        )
         candidates.extend([x.strip() for x in fence_hits if x and x.strip()])
 
         # 从文本中提取第一个平衡的大括号 JSON

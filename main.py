@@ -611,35 +611,16 @@ class HITPlugin(Star):
                 )
             session = self.agent_sessions[queue_key]
 
-            # 构建系统提示词
-            system_prompt = """你是一个哈工大课程助手，负责回答关于课程、资料、教师等信息的问题。
-
-【重要-必须严格遵守】：
-当用户询问任何与"课程"相关的问题时（课程名字/课程内容/课程评价/推荐课程/课程安排等），你【必须】首先调用 search_courses 工具进行搜索！
-不允许直接使用 unified_search 或其他工具搜索课程！
-
-可用工具：
-- search_courses: 【最优先】搜索哈工大课程数据库（用于查找课程信息）
-- get_course_detail: 获取课程详细信息（在 search_courses 之后使用）
-- search_teacher: 搜索教师信息
-- unified_search: 仅用于搜索参考书、教材、试卷等【非课程内容】（当用户明确说"网上搜索"或"参考资料"时使用）
-- rag_query: 查询已入库的课程资料、评价等
-- list_cos_files: 查看COS文件列表
-- scan_group_files: 扫描群文件并入库
-
-工作流程：
-1. 用户问课程 → 必须先调用 search_courses
-2. search_courses 返回结果 → 列出课程列表
-3. 用户选择课程 → 调用 get_course_detail 获取详情
-
-【输出格式要求】：
-- 禁止使用 Markdown 标记语言（如 **加粗**、*斜体*、`代码`、```代码块``` 等）
-- 禁止使用 Emoji 表情符号
-- 使用纯文字输出，用换行和缩进组织结构
-- 列表用数字+点号，如 "1. xxx"
-- 重点内容用"【】"或"()"强调
-
-回答要简洁，列出要点即可。"""
+            # 从文件读取系统提示词
+            prompt_file = os.path.join(
+                os.path.dirname(__file__), "data", "system_prompt.txt"
+            )
+            if os.path.exists(prompt_file):
+                with open(prompt_file, "r", encoding="utf-8") as f:
+                    system_prompt = f.read()
+            else:
+                debug_log(f"系统提示词文件不存在: {prompt_file}", "WARNING")
+                system_prompt = "你是一个哈工大课程助手。"
 
             # 获取聊天提供商
             try:
@@ -1475,7 +1456,12 @@ class HITPlugin(Star):
                                 folders_raw.append(row)
                             else:
                                 # 去重：基于 file_id
-                                fid = str(row.get("file_id") or row.get("fid") or row.get("id") or "")
+                                fid = str(
+                                    row.get("file_id")
+                                    or row.get("fid")
+                                    or row.get("id")
+                                    or ""
+                                )
                                 if fid and fid not in seen_file_ids:
                                     seen_file_ids.add(fid)
                                     files_raw.append(row)
@@ -1600,7 +1586,7 @@ class HITPlugin(Star):
                 continue
             files_raw, folders_raw = _extract_files_and_folders(data)
             for item in _normalize_file_rows(files_raw):
-                key = f"{item.get('file_id', '')}::{item.get('file_name', '')}"
+                key = f"{item.get('file_name', '')}::{item.get('file_size', 0)}"
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_files.append(item)
@@ -1642,7 +1628,7 @@ class HITPlugin(Star):
 
             files_raw, folders_raw = _extract_files_and_folders(data)
             for item in _normalize_file_rows(files_raw):
-                key = f"{item.get('file_id', '')}::{item.get('file_name', '')}"
+                key = f"{item.get('file_name', '')}::{item.get('file_size', 0)}"
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_files.append(item)
@@ -1659,7 +1645,8 @@ class HITPlugin(Star):
                 f"文件列表: {[f.get('file_name', '?') for f in all_files]}",
                 "DEBUG",
             )
-            return all_files
+
+        return all_files
 
     async def _napcat_download_group_file(
         self, event: AstrMessageEvent, file_ref: Dict[str, str]
