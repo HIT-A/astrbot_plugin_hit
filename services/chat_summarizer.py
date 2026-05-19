@@ -4,6 +4,7 @@
 
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
@@ -94,13 +95,15 @@ class ChatSummarizerService:
 
     def __init__(
         self,
-        gemini_api_key: str,
-        gemini_model: str = "gemini-2.5-flash-preview-05-20",
+        api_key: str,
+        model: str = "MiniMax-M2.7",
+        base_url: str = "https://api.minimaxi.com",
         summary_time: str = "22:30",
         min_educational_score: float = 0.6,
     ):
-        self.gemini_api_key = gemini_api_key
-        self.gemini_model = gemini_model
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
         self.summary_time = summary_time
         self.min_educational_score = min_educational_score
         self._pending_summaries: Dict[str, DailySummary] = {}  # 待确认总结
@@ -239,22 +242,21 @@ class ChatSummarizerService:
 
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # 分析消息
         analyzed_messages = await self.analyze_messages(messages)
 
-        # 统计信息
         total_messages = len(analyzed_messages)
         active_users = len(set(m.sender_id for m in analyzed_messages))
         educational_messages = [m for m in analyzed_messages if m.is_educational]
 
-        # 使用AI生成总结
         summary_text = ""
         hot_topics = []
         key_questions = []
 
-        if use_ai and self.gemini_api_key and educational_messages:
+        if use_ai and self.api_key and educational_messages:
             try:
-                ai_summary = await self._generate_ai_summary(educational_messages)
+                ai_summary = await self._generate_summary_json(
+                    self._build_summary_prompt(educational_messages)
+                )
                 summary_text = ai_summary.get("summary", "")
                 hot_topics = ai_summary.get("hot_topics", [])
                 key_questions = ai_summary.get("key_questions", [])
@@ -269,27 +271,34 @@ class ChatSummarizerService:
             group_id=group_id,
             total_messages=total_messages,
             active_users=active_users,
-            educational_content=educational_messages[:20],  # 最多保留20条
+            educational_content=educational_messages[:20],
             hot_topics=hot_topics,
             key_questions=key_questions,
             summary_text=summary_text,
         )
 
-        # 保存待确认
         async with self._lock:
             self._pending_summaries[group_id] = summary
 
         logger.info(f"✅ 群 {group_id} 每日总结生成完成")
         return summary
 
-    async def _generate_ai_summary(self, messages: List[ChatMessage]) -> Dict[str, Any]:
-        """使用AI生成总结"""
-        # 构建提示
-        context = "\n".join(
-            [f"{m.sender_name}: {m.content}" for m in messages[:50]]  # 最多50条
+    def _strip_reasoning_tags(self, text: str) -> str:
+        """移除 MiniMax 思考过程标签及其内容"""
+        if not text:
+            return text
+        reasoning_pattern = re.compile(
+            r"<\|MiniMax[_\s]?Reasoning\|>.*?<\|Assistant\|>", re.DOTALL
         )
+        text = reasoning_pattern.sub("", text)
+        thinking_boss_pattern = re.compile(r"<\|Thinking\|>.*?<\|Output\|>", re.DOTALL)
+        text = thinking_boss_pattern.sub("", text)
+        return text.strip()
 
-        prompt = f"""分析以下群聊消息，生成每日精华总结。
+    def _build_summary_prompt(self, messages: List[ChatMessage]) -> str:
+        """构建总结提示"""
+        context = "\n".join([f"{m.sender_name}: {m.content}" for m in messages[:50]])
+        return f"""分析以下群聊消息，生成每日精华总结。
 
 消息内容:
 {context}
@@ -312,20 +321,46 @@ class ChatSummarizerService:
 2. 提取有价值的问题和讨论
 3. 总结要简洁明了"""
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent",
-                headers={"Content-Type": "application/json"},
-                params={"key": self.gemini_api_key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json"},
-                },
-            )
+    async def _generate_summary_json(self, prompt: str) -> Dict[str, Any]:
+        """生成结构化总结（调用AI）"""
+
+        url = f"{self.base_url}/v1/text/chatcompletion_v2"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "name": "MiniMax AI"},
+                {"role": "user", "content": prompt, "name": "用户"},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
+
+        text = None
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(msg, dict):
+                text = msg.get("content")
+
+        if not text and isinstance(data, dict):
+            text = data.get("reply") or data.get("output")
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"MiniMax响应缺少可解析文本: keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
+            )
+
+        text = self._strip_reasoning_tags(text).strip()
+        return json.loads(text)
 
     def _generate_simple_summary(self, messages: List[ChatMessage]) -> str:
         """生成简单总结（无AI时）"""
@@ -416,5 +451,5 @@ class ChatSummarizerService:
             "running": self._running,
             "summary_time": self.summary_time,
             "pending_summaries": len(self._pending_summaries),
-            "api_configured": bool(self.gemini_api_key),
+            "api_configured": bool(self.api_key),
         }

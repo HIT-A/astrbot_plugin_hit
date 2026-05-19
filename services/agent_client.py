@@ -2,7 +2,6 @@
 Agent Backend HTTP客户端 - 调用agent-backend的技能API
 """
 
-import json
 import asyncio
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -60,6 +59,36 @@ class AgentClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
+    def _unwrap_double_nested(self, output: Any) -> Any:
+        """
+        修复后端双重嵌套问题。
+        后端有些 skill 返回 {"ok": true, "output": {"ok": true, "output": {...}}}
+        这种结构会被错误地嵌套，需要展开为标准结构。
+
+        双重嵌套示例: {"ok": true, "output": {"ok": true, "output": {"query": "...", "results": [...]}}}
+        正确返回: {"query": "...", "results": [...]}
+        """
+        if not isinstance(output, dict):
+            return output
+
+        if output.get("ok") is not True:
+            return output
+
+        inner = output.get("output")
+        if not isinstance(inner, dict):
+            return output
+
+        inner_ok = inner.get("ok")
+        innermost = inner.get("output")
+
+        if inner_ok is True and isinstance(innermost, dict):
+            innermost_keys = set(innermost.keys())
+            data_keys = innermost_keys - {"ok", "output"}
+            if data_keys:
+                return innermost
+
+        return inner
+
     async def invoke_skill(
         self,
         skill_name: str,
@@ -97,9 +126,19 @@ class AgentClient:
 
                 # 解析响应
                 if data.get("ok", False):
+                    output = data.get("output")
+                    # New async skills may return job_id without output payload.
+                    if output is None and data.get("job_id"):
+                        output = {
+                            "job_id": data.get("job_id"),
+                            "status": "queued",
+                        }
+                    # 修复后端双重嵌套问题: {"ok": true, "output": {"ok": true, "output": {...}}}
+                    # 展开为标准结构 {"ok": true, "output": {...}}
+                    output = self._unwrap_double_nested(output)
                     return AgentResponse(
                         success=True,
-                        output=data.get("output"),
+                        output=output,
                         raw_response=data,
                     )
                 else:
@@ -162,19 +201,27 @@ class AgentClient:
     async def get_course_detail(
         self,
         course_code: str,
+        campus: str = "shenzhen",
+        include_toml: bool = False,
     ) -> AgentResponse:
         """
         获取课程详情
 
         Args:
             course_code: 课程代码
+            campus: 校区
+            include_toml: 是否返回 readme_toml
 
         Returns:
             AgentResponse
         """
         return await self.invoke_skill(
-            "courses.get",
-            {"course_code": course_code},
+            "course.read",
+            {
+                "campus": campus,
+                "course_code": course_code,
+                "include_toml": include_toml,
+            },
         )
 
     async def search_files(
@@ -197,15 +244,17 @@ class AgentClient:
             AgentResponse
         """
         input_data = {
-            "keyword": keyword,
-            "limit": limit,
+            "query": keyword,
+            "sources": ["cos", "rag"],
+            "top_k": limit,
+            "summarize": False,
         }
         if course_code:
             input_data["course_code"] = course_code
         if file_type:
             input_data["file_type"] = file_type
 
-        return await self.invoke_skill("files.search", input_data)
+        return await self.invoke_skill("search", input_data)
 
     async def upload_file(
         self,
@@ -220,7 +269,7 @@ class AgentClient:
 
         Args:
             file_content: 文件内容（bytes）
-            file_name: 文件名
+            file_name: 文件名（用作 COS key）
             course_code: 关联课程代码（可选）
             description: 文件描述（可选）
             metadata: 元数据（可选）
@@ -233,9 +282,10 @@ class AgentClient:
         # 将文件内容转为base64
         file_base64 = base64.b64encode(file_content).decode("utf-8")
 
+        # files.upload 需要 key 和 content_base64（不是 file_name/file_content）
         input_data = {
-            "file_name": file_name,
-            "file_content": file_base64,
+            "key": file_name,
+            "content_base64": file_base64,
         }
         if course_code:
             input_data["course_code"] = course_code
@@ -253,6 +303,8 @@ class AgentClient:
         ratings: Optional[Dict[str, int]] = None,
         semester: Optional[str] = None,
         teacher: Optional[str] = None,
+        campus: str = "shenzhen",
+        idempotency_key: Optional[str] = None,
     ) -> AgentResponse:
         """
         提交课程评价
@@ -267,18 +319,31 @@ class AgentClient:
         Returns:
             AgentResponse
         """
-        input_data = {
-            "course_code": course_code,
-            "content": content,
-        }
+        op_content = content
         if ratings:
-            input_data["ratings"] = ratings
+            op_content += (
+                f"\n\n评分: 内容{ratings.get('content', '-')}/5, "
+                f"教学{ratings.get('teaching', '-')}/5, "
+                f"总体{ratings.get('overall', '-')}/5"
+            )
         if semester:
-            input_data["semester"] = semester
-        if teacher:
-            input_data["teacher"] = teacher
+            op_content += f"\n学期: {semester}"
 
-        return await self.invoke_skill("reviews.submit", input_data)
+        input_data = {
+            "campus": campus,
+            "course_code": course_code,
+            "ops": [
+                {
+                    "op": "add_lecturer_review",
+                    "lecturer_name": teacher or "匿名",
+                    "content": op_content,
+                }
+            ],
+        }
+        if idempotency_key:
+            input_data["idempotency_key"] = idempotency_key
+
+        return await self.invoke_skill("pr.submit", input_data)
 
     async def create_pr(
         self,
@@ -303,17 +368,130 @@ class AgentClient:
         Returns:
             AgentResponse
         """
-        input_data = {
-            "title": title,
-            "content": content,
-            "target_org": target_org,
-            "target_repo": target_repo,
-            "branch": branch,
-        }
-        if files:
-            input_data["files"] = files
+        return AgentResponse(
+            success=False,
+            error={
+                "message": (
+                    "github.create_pr 已下线，请改用 pr.submit（课程变更）"
+                    "或在调用方直接走 GitHub API。"
+                )
+            },
+        )
 
-        return await self.invoke_skill("github.create_pr", input_data)
+    async def preview_pr(
+        self,
+        campus: str,
+        course_code: str,
+        ops: List[Dict[str, Any]],
+    ) -> AgentResponse:
+        """调用 pr.preview 预览课程变更。"""
+        return await self.invoke_skill(
+            "pr.preview",
+            {
+                "campus": campus,
+                "course_code": course_code,
+                "ops": ops,
+            },
+        )
+
+    async def submit_pr(
+        self,
+        campus: str,
+        course_code: str,
+        ops: List[Dict[str, Any]],
+        idempotency_key: Optional[str] = None,
+        pr: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
+        """调用 pr.submit 提交课程改动。"""
+        input_data: Dict[str, Any] = {
+            "campus": campus,
+            "course_code": course_code,
+            "ops": ops,
+        }
+        if idempotency_key:
+            input_data["idempotency_key"] = idempotency_key
+        if pr:
+            input_data["pr"] = pr
+        return await self.invoke_skill("pr.submit", input_data)
+
+    async def lookup_pr(self, org: str, repo: str, number: int) -> AgentResponse:
+        """调用 pr.lookup 查询 PR 状态。"""
+        return await self.invoke_skill(
+            "pr.lookup",
+            {
+                "org": org,
+                "repo": repo,
+                "number": number,
+            },
+        )
+
+    async def wait_for_job(
+        self,
+        job_id: str,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        轮询异步 job 直到完成
+
+        Args:
+            job_id: job ID
+            timeout: 超时时间（秒）
+            poll_interval: 轮询间隔（秒）
+
+        Returns:
+            job 输出数据
+
+        Raises:
+            TimeoutError: 超时
+            RuntimeError: job 失败
+        """
+        import time
+
+        start_time = time.time()
+        max_wait = timeout
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait:
+                raise TimeoutError(f"Job {job_id} timed out after {max_wait}s")
+
+            try:
+                client = await self._get_client()
+                resp = await client.get(
+                    f"{self.base_url}/v1/jobs/{job_id}",
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                job = data.get("job", {})
+                status = job.get("status")
+
+                if status == "succeeded":
+                    output_json = job.get("output_json")
+                    if output_json is None:
+                        return {}
+                    # 同样需要 unwrap 双重嵌套
+                    return self._unwrap_double_nested(output_json)
+                elif status == "failed":
+                    error = job.get("error", {})
+                    error_msg = (
+                        error.get("message", "Job failed")
+                        if isinstance(error, dict)
+                        else str(error)
+                    )
+                    raise RuntimeError(f"Job {job_id} failed: {error_msg}")
+                elif status in ("queued", "running"):
+                    await asyncio.sleep(poll_interval)
+                else:
+                    logger.warning(f"Unknown job status: {status}")
+                    await asyncio.sleep(poll_interval)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Polling job {job_id} error: {e}")
+                await asyncio.sleep(poll_interval)
 
     async def health_check(self) -> bool:
         """

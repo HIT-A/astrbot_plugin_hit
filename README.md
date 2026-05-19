@@ -1,210 +1,155 @@
-# HIT Plugin for AstrBot
+# HIT 智能助手插件（AstrBot）
 
-哈工大智能助手插件 - 基于混合AI架构的群聊智能助手
+面向哈工大课程生态的群聊助手插件，聚焦三类能力：
+- 课程与资料检索
+- 群文件入库（对接 agent-backend）
+- 贡献引导与课程内容沉淀
 
-## Architecture
+当前版本已对齐 2026-03-17 的 agent-backend skills 契约（`search`、`course.read`、`pr.*`、`data.ingest` 等）。
 
-```
-User Message
-    │
-    ▼
-┌─────────────────────────────────────┐
-│ Message Queue (3-min window)        │
-└──────────────────┬──────────────────┘
-                   │
-    ┌──────────────┼──────────────┐
-    ▼              ▼              ▼
-┌────────┐   ┌──────────┐   ┌──────────┐
-│History │   │  Gemini  │   │  Intent  │
-│Manager │   │  Flash   │   │  Store   │
-└────────┘   └────┬─────┘   └──────────┘
-                  │
-        ┌─────────┴─────────┐
-        ▼                   ▼
-   ┌─────────┐        ┌──────────┐
-   │  Chat   │        │  Valid   │
-   │ (Ignore)│        │  Intent  │
-   └─────────┘        └────┬─────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-        ┌─────────┐  ┌─────────┐  ┌─────────┐
-        │ Course  │  │  File   │  │  Deep   │
-        │ Search  │  │ Search  │  │ Search  │
-        └────┬────┘  └────┬────┘  └────┬────┘
-             │            │            │
-             └────────────┼────────────┘
-                          ▼
-                   ┌──────────────┐
-                   │  Main Agent  │
-                   │  (AstrBot)   │
-                   └──────────────┘
-```
+## 1. 已实现功能
 
-## Features
+### 1.1 消息队列与意图分析
+- 基于 `core/message_queue.py` 做 3 分钟滑窗聚合。
+- `main.py` 中定时任务循环按间隔触发意图分析。
+- 通过 `services/intent_service.py` 和 `services/intent_classifier.py` 做意图识别与结构化提取。
 
-### 1. Intent Classification Service (`services/intent_classifier.py`)
-- Uses **Gemini Flash** (cheap) for intent classification
-- Classifies intents: `COURSE_QUERY`, `FILE_SEARCH`, `DEEP_SEARCH`, `CONTRIBUTION`, `CHAT`
-- Returns structured intent with confidence score
-- Filters out chat/noise to save main agent cost
-- Daily quota management (default: 250 calls/day)
+### 1.2 课程检索
+- 命令：`/hit course <关键词>`。
+- 调用 `courses.search`，返回课程列表，支持自然语言关键词。
+- 代码入口：`main.py::_search_course`、`services/agent_client.py::search_courses`。
 
-### 2. Tool Definitions (`tools/`)
+### 1.3 资料检索与深度搜索
+- 命令：
+    - `/hit file <关键词>`：资料搜索
+    - `/hit search <关键词>`：深度搜索
+- 统一通过 `search` skill，按 `sources` 组合查询（如 `cos/rag/brave/arxiv/github`）。
+- 代码入口：`main.py::_handle_file_search`、`main.py::_handle_deep_search`、`services/agent_client.py::search_files`。
 
-#### `hit_course_search`
-Search HIT course information by code, name, or teacher.
+### 1.4 群文件扫描与入库
+- 命令：
+    - `/hit scan`
+    - `/hit ingest [limit]`
+- 扫描流程：
+    - 按扩展名和大小过滤
+    - MD5 去重
+    - 记录候选文件
+- 入库流程：
+    - 当前实现走 `data.ingest`（`source_type=manual`）
+    - 兼容异步 `job_id` 返回
+- 代码入口：`services/file_scanner.py`、`main.py::ingest_cmd`。
 
-#### `hit_file_search`
-Search files in group files and COS storage.
+### 1.5 贡献与 PR 相关能力（客户端层）
+- `services/agent_client.py` 已提供：
+    - `preview_pr` -> `pr.preview`
+    - `submit_pr` -> `pr.submit`
+    - `lookup_pr` -> `pr.lookup`
+- `submit_review` 已改为通过 `pr.submit` 提交 `add_lecturer_review` 操作。
 
-#### `hit_deep_search`
-Deep search papers, literature, and technical materials (including arXiv and GitHub).
+### 1.6 状态与诊断
+- 命令：
+    - `/hit status`
+    - `/hit debug`
+- 提供额度、队列、任务、扫描统计、配置状态等观测信息。
 
-#### `hit_contribute_guide`
-Guide users to contribute content (reviews, files).
+## 2. 关键实现说明
 
-### 3. History Management (`core/history_manager.py`)
-- Learned from SpectreCore's HistoryStorage
-- Stores chat history with metadata
-- Supports retrieval for summarization
-- File-based persistence with JSONL format
-- Automatic cleanup of old history
+## 2.1 模块结构
 
-### 4. File Scanner (`services/file_scanner.py`)
-- Learned from GroupFS design
-- Gets group file list
-- Calculates MD5 hash for deduplication
-- Uploads to COS (no local storage)
-- Stream processing for large files
-
-### 5. Chat Summarizer (`services/chat_summarizer.py`)
-- Learned from Daily Analysis plugin
-- Incremental analysis (only new messages)
-- Filters educational content
-- Generates summary with main agent
-- Admin confirmation before ingesting
-
-### 6. Main Plugin (`main.py`)
-- Registers tools with `@filter.llm_tool`
-- Routes to appropriate handler based on intent
-- Uses main agent for complex interactions
-- Uses Gemini for simple classification
-
-## Directory Structure
-
-```
+```text
 astrbot_plugin_hit/
-├── main.py                    # Main plugin entry
-├── core/                      # Core modules
-│   ├── __init__.py
-│   ├── config.py             # Configuration management
-│   ├── message_queue.py      # 3-minute sliding window queue
-│   └── history_manager.py    # Chat history with metadata
-├── services/                  # Business services
-│   ├── __init__.py
-│   ├── intent_classifier.py  # Gemini Flash intent classification
-│   ├── file_scanner.py       # Group file scanning
-│   ├── chat_summarizer.py    # Daily chat summary
-│   └── agent_client.py       # Main agent client
-├── tools/                     # Tool implementations
-│   ├── __init__.py
-│   ├── course_tool.py        # Course search tool
-│   ├── file_tool.py          # File search tool
-│   └── search_tool.py        # Deep search tool
-└── utils/                     # Utility functions
-    └── __init__.py
+├── main.py
+├── core/
+│   ├── config.py
+│   ├── history_manager.py
+│   └── message_queue.py
+├── services/
+│   ├── agent_client.py
+│   ├── file_scanner.py
+│   ├── intent_service.py
+│   ├── intent_classifier.py
+│   ├── chat_summarizer.py
+│   └── contribution_service.py
+├── tools/
+└── utils/
 ```
 
-## Configuration
+## 2.2 AgentClient 设计
+- 统一入口：`invoke_skill(skill_name, input_data)`。
+- 重试策略：超时/异常指数退避；4xx 不重试。
+- 返回结构：标准化为 `AgentResponse(success, output, error, raw_response)`。
+- 对异步 skill（仅返回 `job_id`）做了兼容映射，避免调用方空输出崩溃。
 
-Add to AstrBot configuration:
+## 2.3 文件入库策略
+- 由于后端新增聚合入口，插件从 `rag.ingest` 迁移到 `data.ingest`。
+- 当前将扫描结果转换为 manual source 内容体，优先保证链路稳定可用。
 
-```yaml
-# Gemini Configuration
-HIT_GEMINI_API_KEY=your_gemini_api_key
-HIT_GEMINI_MODEL=gemini-2.5-flash-preview-05-20
-HIT_GEMINI_DAILY_QUOTA=250
+## 2.4 配置读取
+- 通过 `core/config.py` 读取以下环境变量（`HITSZ_*` 前缀）：
+    - `HITSZ_AI_API_KEY`
+    - `HITSZ_AI_BASE_URL`（默认 `https://api.minimaxi.com`）
+    - `HITSZ_AI_INTENT_MODEL`（默认 `M2-her`）
+    - `HITSZ_AI_COMPLEX_MODEL`（默认 `M2-her`）
+    - `HITSZ_AGENT_BACKEND_URL`
+    - `HITSZ_AGENT_BACKEND_API_KEY`
+    - `HITSZ_INTENT_CHECK_INTERVAL`
+    - `HITSZ_DAILY_SUMMARY_TIME`
+    - `HITSZ_MAX_FILE_SIZE_MB`
+    - `HITSZ_CONTEXT_WINDOW_MINUTES`
 
-# Agent Backend
-HIT_AGENT_BACKEND_URL=http://localhost:8080
-HIT_AGENT_BACKEND_API_KEY=
+兼容说明：
+- 仍可读取旧变量 `HITSZ_GLM_*` 作为兜底。
 
-# Scheduler
-HIT_INTENT_CHECK_INTERVAL=180  # 3 minutes
-HIT_DAILY_SUMMARY_TIME=22:30
-HIT_CONTEXT_WINDOW_MINUTES=3
+## 3. 使用命令
 
-# Admin
-HIT_ADMIN_USER_ID=123456789
+```text
+/hit help
+/hit course <关键词>
+/hit file <关键词>
+/hit search <关键词>
+/hit scan
+/hit ingest [limit]
+/hit status
+/hit debug
+/hit contribute
 
-# File Processing
-HIT_MAX_FILE_SIZE_MB=50
-HIT_SUPPORTED_EXTENSIONS=pdf,doc,docx,ppt,pptx,txt,md
-
-# COS (Tencent Cloud Object Storage)
-HIT_COS_BUCKET=your-bucket
-HIT_COS_REGION=ap-guangzhou
-HIT_COS_SECRET_ID=your-secret-id
-HIT_COS_SECRET_KEY=your-secret-key
+# 贡献闭环（推荐）
+/hit contribute mode=preview campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content="讲解清晰，作业适中" semester=2026春
+/hit contribute mode=submit campus=shenzhen course_code=AUTO1001 course_name=自动控制原理 teacher=张老师 content="讲解清晰，作业适中" semester=2026春
 ```
 
-## Commands
+说明：
+- `mode=preview` 仅预览，不创建 PR。
+- `mode=submit` 提交 PR。
+- multi 仓库自动路由：
+    - 有 `teacher` -> `add_course_teacher_review`
+    - 无 `teacher` -> `append_course_section_item`
+- normal 仓库使用 `add_lecturer_review`。
+- 已禁用 `append_course_review`，不会再生成该 op。
 
-### Admin Commands
-- `/hit_scan` - Manually trigger group file scan
-- `/hit_ingest` - Ingest uploaded files to knowledge base
-- `/hit_summary` - Manually trigger chat summary
-- `/hit_status` - Check plugin status
-
-### User Commands (via LLM Tools)
-The plugin registers LLM tools that the main agent can call:
-- `hit_course_search` - Search courses
-- `hit_file_search` - Search files
-- `hit_deep_search` - Deep search papers/materials
-- `hit_contribute_guide` - Get contribution guidance
-
-## Workflow
-
-### Intent Detection Flow
-1. Messages are added to a 3-minute sliding window queue
-2. Every 3 minutes (08:00-22:00), Gemini Flash classifies intent
-3. Chat/noise is filtered out (saving main agent cost)
-4. Valid intents are stored for the main agent to handle
-
-### File Scanning Flow
-1. Admin triggers `/hit_scan`
-2. Plugin fetches group file list
-3. For each file:
-   - Calculate MD5 hash
-   - Check if already uploaded (dedup)
-   - Download to memory (no local storage)
-   - Upload to COS
-   - Store metadata
-4. Admin triggers `/hit_ingest` to add to knowledge base
-
-### Daily Summary Flow
-1. Scheduled at 22:30 daily
-2. Fetches messages from the day
-3. Filters educational content (courses, exams, etc.)
-4. Generates summary using main agent
-5. Sends to admin for confirmation
-6. Admin can approve/reject the summary
-
-## Requirements
-
+## 4. 运行依赖
 - Python 3.9+
-- httpx (async HTTP client)
-- apscheduler (scheduled tasks)
-- AstrBot framework
+- AstrBot 运行时
+- `httpx`
+- 可访问的 agent-backend 服务（默认 `http://localhost:8080`）
 
-## Installation
+## 5. 未来开发目标
 
-1. Copy the `astrbot_plugin_hit` folder to AstrBot's plugins directory
-2. Configure environment variables or config file
-3. Restart AstrBot
-4. Use `/hit_status` to verify installation
+## 5.1 短期（1-2 周）
+- 将 `contribution_service` 从“文案引导”升级为可实际触发 `pr.preview/pr.submit` 的完整会话流程。
+- 为 `data.ingest` 增加任务轮询与结果回执（基于 `job_id` 查询），完善入库可观测性。
+- 增加关键链路的最小集成测试（course/file/search/ingest/pr.lookup）。
 
-## License
+## 5.2 中期（2-4 周）
+- 引入群级配置（campus、目标仓库、管理员白名单）并持久化。
+- 优化文件扫描接入：补齐平台回调适配，提升真实群环境可用性。
+- 输出统一的错误码和用户提示模板，降低运维排障成本。
 
-MIT License
+## 5.3 长期（1-2 月）
+- 构建“从群聊到课程仓库”的闭环：识别贡献意图 -> 结构化采集 -> PR 预览/提交流程自动化。
+- 完善知识沉淀策略：扫描文件、课程评价、FAQ 同步进入统一检索入口。
+- 增加插件级观测面板（调用量、成功率、延迟、失败分布）。
+
+## 6. 开发备注
+- 本仓库当前存在未跟踪开发文件（如 `data/`、`smoke_cmd_test.py`），提交前建议按发布策略筛选。
+- 若后端 skills 再次变更，请优先更新 `services/agent_client.py` 的映射层，避免在业务层散落改动。
